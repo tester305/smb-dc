@@ -17,7 +17,13 @@
  * Correctness:
  *  - $400E noise-period writes now take effect immediately; the old code kept the previous
  *    divider countdown, which audibly delayed/smeared fast drum rolls and pitch changes.
- *  - $4017 frame-counter mode is implemented (5-step sequence) instead of ignored.
+ *  - $4017 frame-counter handling is now hardware-accurate, which matters a lot for SMB:
+ *    the game writes $4017 = $FF (5-step mode) from the NMI handler EVERY video frame
+ *    (verified in smbdis.asm, SoundEngine/SndOn). On hardware any $4017 write RESETS the
+ *    frame divider, so SMB's APU runs exactly 3 quarter-frames + 1 half-frame per video
+ *    frame - the 4th/5th steps of the 5-step sequence are never reached. Getting this
+ *    wrong makes music drums (length 2 = $400F $18) decay at the wrong rate, envelopes
+ *    tick 4/3x too fast, and triangle bass notes (linear counter 31) cut off ~25% early.
  *  - Duty phase is no longer reset on $4003 writes - real hardware doesn't reset it, and
  *    resetting caused small waveform discontinuities on rapidly retriggered effects.
  *  - Sweep updates never write back a wrapped negative period (defensive clamp).
@@ -171,9 +177,13 @@ void apu_write(uint16_t a, uint8_t d)
         tri.enabled   = (d >> 2) & 1; if (!tri.enabled)   tri.length = 0;
         nz.enabled    = (d >> 3) & 1; if (!nz.enabled)    nz.length = 0;
         break;
-    case 0x4017:                          /* frame counter: bit 7 = 5-step mode */
+    case 0x4017:                          /* frame counter: bit 7 = 5-step mode. ANY write
+                                             resets the divider (fc_acc too) - SMB rewrites
+                                             $4017 = $FF every video frame, slaving the APU
+                                             frame clock to video timing */
         fc_mode = d >> 7;
         fc_step = 0;
+        fc_acc = 0;
         break;
     default: break;
     }
@@ -260,15 +270,23 @@ void apu_generate(int16_t *out, int n)
         float p_sum = 0.0f, t_out = 0.0f, n_out = 0.0f, s, y, v;
         int k;
 
-        /* frame counter: 240 Hz quarter frames, 120 Hz half frames */
+        /* frame counter: quarter/half-frame sequence (mode set via $4017) */
         fc_acc += 240.0f / NES_AUDIO_RATE;
         if (fc_acc >= 1.0f) {
             fc_acc -= 1.0f;
-            if (fc_mode) { if (++fc_step >= 5) fc_step = 0; }
-            else         { fc_step = (fc_step + 1) & 3; }
-            clock_quarter();
-            if (fc_mode ? (fc_step == 2 || fc_step == 4) : !(fc_step & 1))
-                clock_half();
+            if (fc_mode) {
+                if (++fc_step >= 5) fc_step = 0;
+                if (fc_step != 4) {       /* 5-step: step 4 of the sequence clocks nothing */
+                    clock_quarter();
+                    if (fc_step == 3 || fc_step == 0)   /* half frames at steps 3 and 5 */
+                        clock_half();
+                }
+            } else {
+                fc_step = (fc_step + 1) & 3;
+                clock_quarter();
+                if (!(fc_step & 1))       /* 4-step: half frames at steps 2 and 4 */
+                    clock_half();
+            }
         }
 
         for (k = 0; k < 2; k++) {
