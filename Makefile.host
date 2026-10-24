@@ -1,0 +1,13 @@
+# Host-side (PC) test build of the emulation core.  `make -f Makefile.host test ROM=path/to/main.nes`
+CFLAGS ?= -O2 -Wall
+SRCS = src/cpu.c src/ppu.c src/apu.c src/nes.c src/host_main.c
+ROM ?= main.nes
+
+smb_host: $(SRCS) src/nes.h
+	$(CC) $(CFLAGS) -o $@ $(SRCS)
+
+test: smb_host
+	./smb_host $(ROM) 1800
+
+clean:
+	rm -f smb_host
