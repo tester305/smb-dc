@@ -19,16 +19,16 @@ jobs:
 
       - name: Setup KallistiOS & Toolchain
         run: |
+          sudo mkdir -p /opt/toolchains
+          sudo chown -R $USER:$USER /opt/toolchains
           git clone https://github.com/KallistiOS/KallistiOS.git $HOME/kos
           cd $HOME/kos
           cp doc/environ.sh.sample environ.sh
           echo "export KOS_BASE='$HOME/kos'" >> environ.sh
           echo "export KOS_PORTS='$HOME/kos/ports'" >> environ.sh
           echo "export DC_ARM_CC='none'" >> environ.sh
-          
-          # kos-chain yapılandırma dosyasını kopyala
+          . ./environ.sh
           cd utils/kos-chain
-          cp Makefile.cfg.sample Makefile.cfg
           make
 
       - name: Build Super Mario Bros DC
