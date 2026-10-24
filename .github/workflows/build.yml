@@ -26,7 +26,9 @@ jobs:
           echo "export KOS_PORTS='$HOME/kos/ports'" >> environ.sh
           echo "export DC_ARM_CC='none'" >> environ.sh
           
+          # kos-chain yapılandırma dosyasını kopyala
           cd utils/kos-chain
+          cp Makefile.cfg.sample Makefile.cfg
           make
 
       - name: Build Super Mario Bros DC
