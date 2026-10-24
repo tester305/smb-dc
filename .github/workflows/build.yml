@@ -19,7 +19,7 @@ jobs:
 
       - name: Setup KallistiOS & Toolchain
         run: |
-          git clone --recursive https://github.com/KallistiOS/KallistiOS.git $HOME/kos
+          git clone https://github.com/KallistiOS/KallistiOS.git $HOME/kos
           cd $HOME/kos
           cp doc/environ.sh.sample environ.sh
           echo "export KOS_BASE='$HOME/kos'" >> environ.sh
