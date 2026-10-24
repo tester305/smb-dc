@@ -7,45 +7,71 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install System Dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libelf-dev libpng-dev wget git texinfo bison flex libgmp3-dev libmpfr-dev libmpc-dev gettext zlib1g-dev
+          sudo apt-get install -y build-essential texinfo libjpeg-dev libpng-dev libelf-dev \
+            git subversion python3 wget curl gettext bison flex libgmp-dev libmpfr-dev libmpc-dev cc65
 
-      - name: Setup KallistiOS & Toolchain
+      - name: Clone KallistiOS and create environ.sh
         run: |
-          sudo mkdir -p /opt/toolchains
-          sudo chown -R $USER:$USER /opt/toolchains
-          git clone https://github.com/KallistiOS/KallistiOS.git $HOME/kos
-          cd $HOME/kos
-          
-          # Doğrudan hatasız environ.sh dosyamızı yazıyoruz
-          cat << 'EOT' > environ.sh
-          export KOS_BASE="$HOME/kos"
-          export KOS_PORTS="$HOME/kos/ports"
-          export KOS_CC_BASE="/opt/toolchains/dc"
-          export DC_ARCH="dreamcast"
-          export DC_CVS_HOST="localhost"
-          export DC_ARM_CC="none"
-          . \$KOS_BASE/env/environ_base.sh
-          EOT
-          
-          cd utils/kos-chain
+          sudo mkdir -p /opt/toolchains/dc
+          sudo chown -R "$USER":"$USER" /opt/toolchains
+          git clone --depth 1 https://github.com/KallistiOS/KallistiOS.git /opt/toolchains/dc/kos
+          cp /opt/toolchains/dc/kos/doc/environ.sh.sample /opt/toolchains/dc/kos/environ.sh
+
+      - name: Restore cached SH-4 toolchain
+        id: tc
+        uses: actions/cache/restore@v4
+        with:
+          path: /opt/toolchains/dc/sh-elf
+          key: kos-sh-elf-stable-ubuntu24-v1
+
+      - name: Build SH-4 toolchain (first run only, about an hour)
+        if: steps.tc.outputs.cache-hit != 'true'
+        run: |
+          cd /opt/toolchains/dc/kos/utils/kos-chain
+          cp Makefile.dreamcast.cfg Makefile.cfg
+          sed -i "s/^makejobs=.*/makejobs=$(nproc)/" Makefile.cfg
           make
 
-      - name: Build Super Mario Bros DC
-        run: |
-          export KOS_BASE="$HOME/kos"
-          . $HOME/kos/environ.sh
-          make
+      - name: Save toolchain to cache
+        if: steps.tc.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /opt/toolchains/dc/sh-elf
+          key: kos-sh-elf-stable-ubuntu24-v1
 
-      - name: Upload ELF Artifact
+      - name: Build KallistiOS
+        run: |
+          . /opt/toolchains/dc/kos/environ.sh
+          cd "$KOS_BASE"
+          make -j"$(nproc)"
+
+      - name: Build Super Mario Bros. for Dreamcast
+        env:
+          SMB_ROM_GZ_B64: ${{ secrets.SMB_ROM_GZ_B64 }}
+        run: |
+          . /opt/toolchains/dc/kos/environ.sh
+          if [ -n "$SMB_ROM_GZ_B64" ]; then
+            echo "$SMB_ROM_GZ_B64" | base64 -d | gunzip > "Super Mario Bros. (World).nes"
+            ./build.sh "Super Mario Bros. (World).nes"
+            rm -f "Super Mario Bros. (World).nes"
+          else
+            echo "::warning::Secret SMB_ROM_GZ_B64 is not set - building without the game, the ELF will say smb.nes is missing"
+            mkdir -p romdisk
+            make
+          fi
+
+      - name: Upload ELF
         uses: actions/upload-artifact@v4
         with:
           name: smb_dc_elf
           path: smb_dc.elf
+          if-no-files-found: error
