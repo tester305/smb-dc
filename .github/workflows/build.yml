@@ -2,22 +2,37 @@ name: Build Dreamcast ELF
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ master, main ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/kallistios/kos:latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build Super Mario Bros DC
+      - name: Install Dependencies
         run: |
-          source /opt/toolchains/dc/kos/environ.sh
-          make
+          sudo apt-get update
+          sudo apt-get install -y build-essential libelf-dev libpng-dev wget git texinfo bison flex
+
+      - name: Setup KallistiOS & Toolchain
+        run: |
+          git clone --recursive https://github.com/KallistiOS/KallistiOS.git /opt/kos
+          cd /opt/kos
+          cp doc/environ.sh.sample environ.sh
+          echo "export KOS_BASE='/opt/kos'" >> environ.sh
+          echo "export KOS_PORTS='/opt/kos/ports'" >> environ.sh
+          echo "export DC_ARM_CC='none'" >> environ.sh
+          echo ". /opt/kos/environ.sh" >> $GITHUB_ENV
+
+      - name: Build Project
+        run: |
+          # Projemizi /opt/kos/utils içine veya KOS dışına kopyalayıp Makefile içindeki KOS_BASE yolunu ayarlayarak derleyebiliriz
+          # Ya da doğrudan projemizi derleyelim:
+          export KOS_BASE=/opt/kos
+          make -C .
 
       - name: Upload ELF Artifact
         uses: actions/upload-artifact@v4
