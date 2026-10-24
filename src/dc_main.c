@@ -3,8 +3,8 @@
  *
  * Runs the ROM built from the SMB disassembly (smb.nes in the romdisk) on the
  * portable NES core in this folder.  Video: the PPU's 256x240 output is uploaded
- * as a PVR texture and drawn full-screen (bilinear).  Audio: AICA stream whose
- * callback pulls samples straight from the software APU.
+ * as a PVR texture and drawn as a quad (see INTEGER_SCALE).  Audio: AICA stream
+ * whose callback pulls samples straight from the software APU.
  *
  * Controls:  D-pad / stick = move      A = jump      X or B = run / fireball
  *            Start = Start             Y = Select
@@ -31,6 +31,10 @@ KOS_INIT_FLAGS(INIT_DEFAULT);
 #define TXR_BYTES        (256 * 256 * 2)
 #define AUDIO_BUF_BYTES  16384            /* AICA stream buffer: ~185 ms at 44.1 kHz mono */
 #define STICK_DEADZONE   40
+
+/* 1 = sharp pixel-perfect 2x (512x480, black bars left/right, nearest filter)
+ * 0 = stretched to the full 4:3 screen (bilinear, softer) */
+#define INTEGER_SCALE    1
 
 static uint16_t fb[256 * 256] __attribute__((aligned(32)));      /* PPU output, rows 0..239 used */
 static int16_t  abuf[AUDIO_BUF_BYTES / 2] __attribute__((aligned(32)));
@@ -126,14 +130,18 @@ int main(int argc, char **argv)
     pvr_init_defaults();
     txr = pvr_mem_malloc(TXR_BYTES);
     pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED,
-                     256, 256, txr, PVR_FILTER_BILINEAR);
+                     256, 256, txr, INTEGER_SCALE ? PVR_FILTER_NEAREST : PVR_FILTER_BILINEAR);
     pvr_poly_compile(&hdr, &cxt);
 
-    /* full-screen quad; the texture is 256x256 but only the top 240 rows hold picture */
-    set_vertex(&vert[0],   0.0f,   0.0f, 0.0f, 0.0f,          PVR_CMD_VERTEX);
-    set_vertex(&vert[1], 640.0f,   0.0f, 1.0f, 0.0f,          PVR_CMD_VERTEX);
-    set_vertex(&vert[2],   0.0f, 480.0f, 0.0f, 240.0f/256.0f, PVR_CMD_VERTEX);
-    set_vertex(&vert[3], 640.0f, 480.0f, 1.0f, 240.0f/256.0f, PVR_CMD_VERTEX_EOL);
+    /* quad; the texture is 256x256 but only the top 240 rows hold picture */
+    {
+        float x0 = INTEGER_SCALE ?  64.0f :   0.0f;
+        float x1 = INTEGER_SCALE ? 576.0f : 640.0f;
+        set_vertex(&vert[0], x0,   0.0f, 0.0f, 0.0f,          PVR_CMD_VERTEX);
+        set_vertex(&vert[1], x1,   0.0f, 1.0f, 0.0f,          PVR_CMD_VERTEX);
+        set_vertex(&vert[2], x0, 480.0f, 0.0f, 240.0f/256.0f, PVR_CMD_VERTEX);
+        set_vertex(&vert[3], x1, 480.0f, 1.0f, 240.0f/256.0f, PVR_CMD_VERTEX_EOL);
+    }
 
     snd_stream_init();
     stream = snd_stream_alloc(audio_cb, AUDIO_BUF_BYTES);
