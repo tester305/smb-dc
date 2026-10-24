@@ -12,27 +12,29 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Dependencies
+      - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libelf-dev libpng-dev wget git texinfo bison flex
+          sudo apt-get install -y build-essential libelf-dev libpng-dev wget git texinfo bison flex libgmp3-dev libmpfr-dev libmpc-dev gettext zlib1g-dev
 
       - name: Setup KallistiOS & Toolchain
         run: |
-          git clone --recursive https://github.com/KallistiOS/KallistiOS.git /opt/kos
-          cd /opt/kos
+          git clone --recursive https://github.com/KallistiOS/KallistiOS.git $HOME/kos
+          cd $HOME/kos
           cp doc/environ.sh.sample environ.sh
-          echo "export KOS_BASE='/opt/kos'" >> environ.sh
-          echo "export KOS_PORTS='/opt/kos/ports'" >> environ.sh
+          echo "export KOS_BASE='$HOME/kos'" >> environ.sh
+          echo "export KOS_PORTS='$HOME/kos/ports'" >> environ.sh
           echo "export DC_ARM_CC='none'" >> environ.sh
-          echo ". /opt/kos/environ.sh" >> $GITHUB_ENV
+          
+          # Toolchain derleme (Sh-elf)
+          cd utils/kos-chain
+          make
 
-      - name: Build Project
+      - name: Build Super Mario Bros DC
         run: |
-          # Projemizi /opt/kos/utils içine veya KOS dışına kopyalayıp Makefile içindeki KOS_BASE yolunu ayarlayarak derleyebiliriz
-          # Ya da doğrudan projemizi derleyelim:
-          export KOS_BASE=/opt/kos
-          make -C .
+          export KOS_BASE="$HOME/kos"
+          . $HOME/kos/environ.sh
+          make
 
       - name: Upload ELF Artifact
         uses: actions/upload-artifact@v4
