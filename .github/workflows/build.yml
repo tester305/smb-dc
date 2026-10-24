@@ -1,0 +1,26 @@
+name: Build Dreamcast ELF
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/kallistios/kos:latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Super Mario Bros DC
+        run: |
+          source /opt/toolchains/dc/kos/environ.sh
+          make
+
+      - name: Upload ELF Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smb_dc_elf
+          path: smb_dc.elf
