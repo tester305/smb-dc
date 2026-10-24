@@ -9,7 +9,10 @@ ROM="${1:-Super Mario Bros. (World).nes}"
 [ -f "$ROM" ] || { echo "ROM not found: $ROM"; echo "usage: ./build.sh \"path/to/Super Mario Bros. (World).nes\""; exit 1; }
 command -v ca65 >/dev/null && command -v ld65 >/dev/null || { echo "cc65 is required:  sudo apt install cc65 make"; exit 1; }
 
-[ -d smb-disassembly ] || git clone --depth 1 https://github.com/threecreepio/smb-disassembly.git
+if [ ! -f smb-disassembly/Makefile ]; then
+    rm -rf smb-disassembly
+    git clone --depth 1 https://github.com/threecreepio/smb-disassembly.git
+fi
 cp "$ROM" "smb-disassembly/Super Mario Bros. (World).nes"
 make -C smb-disassembly clean >/dev/null 2>&1 || true
 make -C smb-disassembly

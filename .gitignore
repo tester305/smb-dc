@@ -1,0 +1,5 @@
+smb-disassembly/
+romdisk/smb.nes
+*.nes
+*.elf
+rom.b64
