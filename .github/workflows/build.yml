@@ -17,7 +17,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential texinfo libjpeg-dev libpng-dev libelf-dev \
-            git subversion python3 wget curl gettext bison flex libgmp-dev libmpfr-dev libmpc-dev cc65
+            git subversion python3 wget curl gettext bison flex libgmp-dev libmpfr-dev libmpc-dev cc65 \
+            meson ninja-build pkg-config libisofs-dev
 
       - name: Clone KallistiOS and create environ.sh
         run: |
@@ -75,3 +76,25 @@ jobs:
           name: smb_dc_elf
           path: smb_dc.elf
           if-no-files-found: error
+
+      - name: Build mkdcdisc
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://gitlab.com/simulant/mkdcdisc.git "$HOME/mkdcdisc"
+          cd "$HOME/mkdcdisc"
+          meson setup builddir
+          meson compile -C builddir
+          ./builddir/mkdcdisc -h || true
+
+      - name: Make CDI disc image
+        continue-on-error: true
+        run: |
+          "$HOME/mkdcdisc/builddir/mkdcdisc" -e smb_dc.elf -o smb.cdi -n "SMB"
+          ls -l smb.cdi
+
+      - name: Upload CDI
+        uses: actions/upload-artifact@v4
+        with:
+          name: smb_dc_cdi
+          path: smb.cdi
+          if-no-files-found: warn
