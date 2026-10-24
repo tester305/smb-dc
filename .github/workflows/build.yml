@@ -24,9 +24,16 @@ jobs:
           git clone https://github.com/KallistiOS/KallistiOS.git $HOME/kos
           cd $HOME/kos
           cp doc/environ.sh.sample environ.sh
+          
+          # Önce KOS_BASE dışa aktarılıyor ki environ.sh doğru yeri bilsin
+          export KOS_BASE="$HOME/kos"
+          export KOS_PORTS="$HOME/kos/ports"
+          export DC_ARM_CC="none"
+          
           echo "export KOS_BASE='$HOME/kos'" >> environ.sh
           echo "export KOS_PORTS='$HOME/kos/ports'" >> environ.sh
           echo "export DC_ARM_CC='none'" >> environ.sh
+          
           . ./environ.sh
           cd utils/kos-chain
           make
