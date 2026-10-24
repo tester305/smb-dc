@@ -1,8 +1,17 @@
-/* Small software APU: 2 pulse, triangle, noise (no DMC - Super Mario Bros. doesn't use it). */
+/*
+ * Small software APU: 2 pulse, triangle, noise (no DMC - Super Mario Bros. doesn't use it).
+ *
+ * Every channel is box-filtered: instead of sampling the square/triangle/noise waves at
+ * 44.1 kHz (which aliases into harsh, inharmonic whine), the wave is averaged over each
+ * output sample.  The mix then goes through a DC-blocking high-pass filter (the NES output
+ * is unipolar, which otherwise makes every note start/stop thump).
+ */
 #include "nes.h"
 #include <string.h>
 
-#define CPU_HZ 1789773.0f
+#define CPU_HZ    1789773.0f
+#define APU_GAIN  30000.0f      /* output loudness; lower this if it is still too loud */
+#define HP_COEF   0.996f        /* DC blocker, about 28 Hz corner */
 
 typedef struct {
     uint8_t  enabled, duty, loop, const_vol, vol, length;
@@ -14,10 +23,10 @@ typedef struct {
 
 static Pulse   pu[2];
 static struct { uint8_t enabled, ctrl, lin_reload_val, lin_reload, lin, length; uint16_t timer; float phase; } tri;
-static struct { uint8_t enabled, loop, const_vol, vol, length, env_start, env_div, env_decay, mode, per; uint16_t lfsr; float acc; } nz;
-static float   fc_acc;
+static struct { uint8_t enabled, loop, const_vol, vol, length, env_start, env_div, env_decay, mode, per; uint16_t lfsr; float next; } nz;
+static float   fc_acc, hp_x, hp_y;
 static int     fc_step;
-static float   pulse_tab[31], tnd_tab[203];
+static float   duty_val[4][8], duty_cum[4][9], tri_val[32], tri_cum[33];
 
 static const uint8_t len_tab[32] = {
     10,254,20,2,40,4,80,6,160,8,60,10,14,12,26,14,12,16,24,18,48,20,96,22,192,24,72,26,16,28,32,30 };
@@ -30,17 +39,26 @@ static const uint8_t tri_seq[32] = {
 
 void apu_reset(void)
 {
-    int i;
+    int i, d;
     memset(pu, 0, sizeof pu);
     memset(&tri, 0, sizeof tri);
     memset(&nz, 0, sizeof nz);
     pu[0].ones_comp = 1;
     nz.lfsr = 1;
-    fc_acc = 0; fc_step = 0;
-    pulse_tab[0] = 0;
-    for (i = 1; i < 31; i++)  pulse_tab[i] = 95.52f / (8128.0f / i + 100.0f);
-    tnd_tab[0] = 0;
-    for (i = 1; i < 203; i++) tnd_tab[i] = 163.67f / (24329.0f / i + 100.0f);
+    fc_acc = 0; fc_step = 0; hp_x = hp_y = 0;
+
+    for (d = 0; d < 4; d++) {
+        duty_cum[d][0] = 0;
+        for (i = 0; i < 8; i++) {
+            duty_val[d][i] = duty_tab[d][i];
+            duty_cum[d][i + 1] = duty_cum[d][i] + duty_val[d][i] / 8.0f;
+        }
+    }
+    tri_cum[0] = 0;
+    for (i = 0; i < 32; i++) {
+        tri_val[i] = tri_seq[i];
+        tri_cum[i + 1] = tri_cum[i] + tri_val[i] / 32.0f;
+    }
 }
 
 void apu_write(uint16_t a, uint8_t d)
@@ -126,12 +144,39 @@ static void clock_half(void)
     if (nz.length && !nz.loop)   nz.length--;
 }
 
+/* integral of a stepped periodic wave (n steps per period) from 0 to x, x in [0,1] */
+static inline float wave_int(const float *cum, const float *val, int n, float x)
+{
+    float s = x * n;
+    int k = (int)s;
+    if (k >= n) return cum[n];
+    return cum[k] + val[k] * (s - (float)k) / (float)n;
+}
+
+/* average value of the wave over [x0, x0+dx] (wrapping), i.e. a box filter */
+static float wave_avg(const float *cum, const float *val, int n, float x0, float dx)
+{
+    float x1 = x0 + dx, area;
+    if (dx >= 1.0f) return cum[n];
+    if (x1 <= 1.0f) area = wave_int(cum, val, n, x1) - wave_int(cum, val, n, x0);
+    else            area = (cum[n] - wave_int(cum, val, n, x0)) + wave_int(cum, val, n, x1 - 1.0f);
+    return area / dx;
+}
+
+static inline float noise_level(void)
+{
+    if (!nz.enabled || !nz.length || (nz.lfsr & 1)) return 0.0f;
+    return nz.const_vol ? nz.vol : nz.env_decay;
+}
+
 void apu_generate(int16_t *out, int n)
 {
     const float cps = CPU_HZ / NES_AUDIO_RATE;       /* CPU cycles per output sample */
     int i;
     for (i = 0; i < n; i++) {
-        int p_sum = 0, t_out = 0, n_out = 0, k;
+        float p_sum = 0.0f, t_out = 0.0f, n_out = 0.0f, s, y, v;
+        float remaining, acc;
+        int k;
 
         fc_acc += 240.0f / NES_AUDIO_RATE;
         if (fc_acc >= 1.0f) {
@@ -143,31 +188,45 @@ void apu_generate(int16_t *out, int n)
 
         for (k = 0; k < 2; k++) {
             Pulse *p = &pu[k];
-            p->phase += (CPU_HZ / (16.0f * (p->timer + 1))) / NES_AUDIO_RATE;
+            float dx = (CPU_HZ / (16.0f * (p->timer + 1))) / NES_AUDIO_RATE;
+            if (p->enabled && p->length && p->timer >= 8 && !(!p->sw_neg && sweep_target(p) > 0x7FF))
+                p_sum += (p->const_vol ? p->vol : p->env_decay) *
+                         wave_avg(duty_cum[p->duty], duty_val[p->duty], 8, p->phase, dx);
+            p->phase += dx;
             if (p->phase >= 1.0f) p->phase -= (float)(int)p->phase;
-            if (p->enabled && p->length && p->timer >= 8 &&
-                !(!p->sw_neg && sweep_target(p) > 0x7FF) &&
-                duty_tab[p->duty][(int)(p->phase * 8) & 7])
-                p_sum += p->const_vol ? p->vol : p->env_decay;
         }
-
-        tri.phase += (CPU_HZ / (32.0f * (tri.timer + 1))) / NES_AUDIO_RATE;
-        if (tri.phase >= 1.0f) tri.phase -= (float)(int)tri.phase;
-        if (tri.enabled && tri.length && tri.lin && tri.timer >= 2)
-            t_out = tri_seq[(int)(tri.phase * 32) & 31];
-
-        nz.acc += cps;
-        while (nz.acc >= noise_per[nz.per]) {
-            uint16_t fb;
-            nz.acc -= noise_per[nz.per];
-            fb = (uint16_t)((nz.lfsr & 1) ^ ((nz.lfsr >> (nz.mode ? 6 : 1)) & 1));
-            nz.lfsr = (uint16_t)((nz.lfsr >> 1) | (fb << 14));
-        }
-        if (nz.enabled && nz.length && !(nz.lfsr & 1)) n_out = nz.const_vol ? nz.vol : nz.env_decay;
 
         {
-            float s = pulse_tab[p_sum] + tnd_tab[3 * t_out + 2 * n_out];
-            out[i] = (int16_t)(s * 26000.0f);
+            float dx = (CPU_HZ / (32.0f * (tri.timer + 1))) / NES_AUDIO_RATE;
+            if (tri.enabled && tri.length && tri.lin && tri.timer >= 2)
+                t_out = wave_avg(tri_cum, tri_val, 32, tri.phase, dx);
+            tri.phase += dx;
+            if (tri.phase >= 1.0f) tri.phase -= (float)(int)tri.phase;
         }
+
+        remaining = cps; acc = 0.0f;
+        while (remaining > 0.0f) {
+            float step = nz.next < remaining ? nz.next : remaining;
+            acc += noise_level() * step;
+            remaining -= step;
+            nz.next -= step;
+            if (nz.next <= 0.0f) {
+                uint16_t fb = (uint16_t)((nz.lfsr & 1) ^ ((nz.lfsr >> (nz.mode ? 6 : 1)) & 1));
+                nz.lfsr = (uint16_t)((nz.lfsr >> 1) | (fb << 14));
+                nz.next += noise_per[nz.per];
+            }
+        }
+        n_out = acc / cps;
+
+        /* NES mixer, linear approximation (accurate to ~1%) */
+        s = 0.00752f * p_sum + 0.00851f * t_out + 0.00494f * n_out;
+
+        y = HP_COEF * (hp_y + s - hp_x);
+        hp_x = s; hp_y = y;
+
+        v = y * APU_GAIN;
+        if (v >  32767.0f) v =  32767.0f;
+        if (v < -32768.0f) v = -32768.0f;
+        out[i] = (int16_t)v;
     }
 }
