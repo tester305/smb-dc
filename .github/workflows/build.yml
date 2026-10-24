@@ -23,18 +23,18 @@ jobs:
           sudo chown -R $USER:$USER /opt/toolchains
           git clone https://github.com/KallistiOS/KallistiOS.git $HOME/kos
           cd $HOME/kos
-          cp doc/environ.sh.sample environ.sh
           
-          # Önce KOS_BASE dışa aktarılıyor ki environ.sh doğru yeri bilsin
+          # Doğrudan hatasız environ.sh dosyamızı yazıyoruz
+          cat << 'EOT' > environ.sh
           export KOS_BASE="$HOME/kos"
           export KOS_PORTS="$HOME/kos/ports"
+          export KOS_CC_BASE="/opt/toolchains/dc"
+          export DC_ARCH="dreamcast"
+          export DC_CVS_HOST="localhost"
           export DC_ARM_CC="none"
+          . \$KOS_BASE/env/environ_base.sh
+          EOT
           
-          echo "export KOS_BASE='$HOME/kos'" >> environ.sh
-          echo "export KOS_PORTS='$HOME/kos/ports'" >> environ.sh
-          echo "export DC_ARM_CC='none'" >> environ.sh
-          
-          . ./environ.sh
           cd utils/kos-chain
           make
 
