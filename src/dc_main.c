@@ -107,38 +107,322 @@ static void set_vertex(pvr_vertex_t *v, float x, float y, float u, float t, uint
     v->oargb = 0;
 }
 
-/* ---- simple main menu ------------------------------------------------- */
+/* ---- menu helpers ----------------------------------------------------- */
 
-#define MENU_ITEMS 2
-static const char *menu_labels[MENU_ITEMS] = {
-    "Start Game",
-    "Quit"
-};
-
-/* Clear the 640x480 RGB565 framebuffer to black */
 static void menu_clear(void)
 {
     memset(vram_s, 0, 640 * 480 * 2);
 }
 
-/* Draw a centered-ish string on a given scanline */
 static void menu_draw_str(int y, const char *str, int highlight)
 {
-    /* bfont is \~12 px wide per character; centre roughly for 640 width */
     int len = (int)strlen(str);
     int x = (640 - len * 12) / 2;
     if (x < 8) x = 8;
 
-    if (highlight) {
-        /* simple prefix cursor */
+    if (highlight)
         bfont_draw_str(vram_s + y * 640 + (x - 16), 640, true, ">");
-    }
     bfont_draw_str(vram_s + y * 640 + x, 640, true, str);
 }
 
+static void menu_draw_str_left(int y, int x, const char *str)
+{
+    bfont_draw_str(vram_s + y * 640 + x, 640, true, str);
+}
+
+/* Wait until A/Start is released then pressed again (or quit combo). */
+static void wait_button(void)
+{
+    int quit_flag = 0;
+    uint8_t prev = 0xFF;
+    int released = 0;
+
+    while (1) {
+        uint8_t pad = read_pad(&quit_flag);
+        if (quit_flag) return;
+        if (!(pad & (PAD_A | PAD_START)))
+            released = 1;
+        if (released && (pad & (PAD_A | PAD_START)) && !(prev & (PAD_A | PAD_START)))
+            return;
+        prev = pad;
+        vid_waitvbl();
+    }
+}
+
+/* Yes/No prompt. Returns 1 = Yes, 0 = No. */
+static int confirm_yes_no(const char *line1, const char *line2)
+{
+    int sel = 0;   /* 0 = No (safer default), 1 = Yes */
+    int quit_flag = 0;
+    uint8_t prev = 0;
+    int debounce = 0;
+
+    bfont_set_encoding(BFONT_CODE_ISO8859_1);
+
+    while (1) {
+        uint8_t pad = read_pad(&quit_flag);
+        if (quit_flag) return 0;
+
+        if (debounce > 0) {
+            debounce--;
+        } else {
+            if ((pad & (PAD_UP | PAD_DOWN | PAD_LEFT | PAD_RIGHT)) &&
+                !(prev & (PAD_UP | PAD_DOWN | PAD_LEFT | PAD_RIGHT))) {
+                sel ^= 1;
+                debounce = 12;
+            }
+            if ((pad & (PAD_A | PAD_START)) && !(prev & (PAD_A | PAD_START))) {
+                return sel;   /* 1 = Yes, 0 = No */
+            }
+            if ((pad & PAD_B) && !(prev & PAD_B)) {
+                return 0;     /* B = cancel / No */
+            }
+        }
+        prev = pad;
+
+        menu_clear();
+        if (line1) menu_draw_str(140, line1, 0);
+        if (line2) menu_draw_str(170, line2, 0);
+        menu_draw_str(240, "Yes", sel == 1);
+        menu_draw_str(280, "No",  sel == 0);
+        menu_draw_str(340, "A/Start = OK   B = Cancel", 0);
+        vid_waitvbl();
+    }
+}
+
+/* ---- self-test suite -------------------------------------------------- */
+
+#define RGB565(r, g, b) (uint16_t)(((r) >> 3) << 11 | ((g) >> 2) << 5 | ((b) >> 3))
+
+static int test_graphics(char *err, size_t errsz)
+{
+    int x, y;
+    uint16_t *v = vram_s;
+    uint16_t colors[8] = {
+        RGB565(255, 0, 0), RGB565(0, 255, 0), RGB565(0, 0, 255), RGB565(255, 255, 0),
+        RGB565(255, 0, 255), RGB565(0, 255, 255), RGB565(255, 255, 255), RGB565(0, 0, 0)
+    };
+
+    menu_clear();
+    menu_draw_str(40, "Testing graphics...", 0);
+    vid_waitvbl();
+
+    /* Color bars */
+    for (y = 80; y < 200; y++) {
+        for (x = 0; x < 640; x++) {
+            v[y * 640 + x] = colors[(x * 8) / 640];
+        }
+    }
+    for (y = 0; y < 30; y++) vid_waitvbl();
+
+    /* Checkerboard */
+    for (y = 210; y < 340; y++) {
+        for (x = 0; x < 640; x++) {
+            int c = ((x / 16) ^ (y / 16)) & 1;
+            v[y * 640 + x] = c ? RGB565(200, 200, 200) : RGB565(40, 40, 40);
+        }
+    }
+    for (y = 0; y < 30; y++) vid_waitvbl();
+
+    /* Write/read-back check on a few pixels */
+    v[100 * 640 + 100] = RGB565(123, 45, 67);
+    v[200 * 640 + 300] = RGB565(10, 20, 30);
+    if (v[100 * 640 + 100] != RGB565(123, 45, 67) ||
+        v[200 * 640 + 300] != RGB565(10, 20, 30)) {
+        snprintf(err, errsz, "Graphics: framebuffer read-back failed");
+        return 0;
+    }
+
+    /* bfont still works after fills */
+    menu_clear();
+    menu_draw_str(200, "Graphics OK", 0);
+    for (y = 0; y < 40; y++) vid_waitvbl();
+    return 1;
+}
+
+static int test_sound_system(char *err, size_t errsz)
+{
+    int i;
+    uint32_t mem;
+
+    menu_clear();
+    menu_draw_str(40, "Testing sound system...", 0);
+    menu_draw_str(80, "(BIOS / AICA init)", 0);
+    vid_waitvbl();
+
+    if (snd_init() != 0) {
+        snprintf(err, errsz, "Sound: snd_init() failed");
+        return 0;
+    }
+
+    mem = snd_mem_available();
+    if (mem == 0) {
+        snd_shutdown();
+        snprintf(err, errsz, "Sound: no AICA RAM available");
+        return 0;
+    }
+
+    /* Exercise stream layer briefly (alloc + destroy) */
+    if (snd_stream_init() != 0) {
+        snd_shutdown();
+        snprintf(err, errsz, "Sound: snd_stream_init() failed");
+        return 0;
+    }
+    snd_stream_shutdown();
+    snd_shutdown();
+
+    menu_clear();
+    menu_draw_str(200, "Sound system OK", 0);
+    for (i = 0; i < 40; i++) vid_waitvbl();
+    return 1;
+}
+
+/* Tiny stream callback used only during APU self-test */
+static int16_t test_tone_buf[1024];
+static void *test_apu_cb(snd_stream_hnd_t hnd, int req_bytes, int *got_bytes)
+{
+    int n = req_bytes / 2;
+    (void)hnd;
+    if (n > 1024) n = 1024;
+    apu_generate(test_tone_buf, n);
+    *got_bytes = n * 2;
+    return test_tone_buf;
+}
+
 /*
- * Blocks until the player chooses an item.
+ * APU self-test: program a short pulse tone, generate samples, check they
+ * are neither silent nor stuck at full scale. Also plays them briefly.
+ */
+static int test_apu(char *err, size_t errsz)
+{
+    int16_t samples[2048];
+    int i, nonzero = 0, clipped = 0;
+    int maxabs = 0;
+    snd_stream_hnd_t h;
+
+    menu_clear();
+    menu_draw_str(40, "Testing APU...", 0);
+    menu_draw_str(80, "You may hear short tones", 0);
+    vid_waitvbl();
+
+    apu_reset();
+
+    /* Enable pulse 1, constant volume, duty 50%, period for \~440 Hz-ish */
+    apu_write(0x4015, 0x01);          /* enable pulse 1 */
+    apu_write(0x4000, 0xBF);          /* duty 2, const vol, vol=15 */
+    apu_write(0x4001, 0x08);          /* sweep off */
+    apu_write(0x4002, 0xFD);          /* timer low  (approx A4) */
+    apu_write(0x4003, 0x00);          /* timer high + length */
+
+    apu_generate(samples, 2048);
+
+    for (i = 0; i < 2048; i++) {
+        int a = samples[i] < 0 ? -samples[i] : samples[i];
+        if (a > 50) nonzero++;
+        if (a >= 30000) clipped++;
+        if (a > maxabs) maxabs = a;
+    }
+
+    if (nonzero < 100) {
+        snprintf(err, errsz, "APU: output was silent (no tone)");
+        apu_reset();
+        return 0;
+    }
+    if (clipped > 1500) {
+        snprintf(err, errsz, "APU: output heavily clipped");
+        apu_reset();
+        return 0;
+    }
+    if (maxabs < 100) {
+        snprintf(err, errsz, "APU: output level too low");
+        apu_reset();
+        return 0;
+    }
+
+    /* Play the tone through AICA so it is audible */
+    if (snd_init() == 0) {
+        snd_stream_init();
+        h = snd_stream_alloc(test_apu_cb, 4096);
+        if (h >= 0) {
+            snd_stream_start(h, NES_AUDIO_RATE, 0);
+            for (i = 0; i < 45; i++) {   /* \~0.75 s */
+                snd_stream_poll(h);
+                vid_waitvbl();
+            }
+            /* Switch to noise for a moment */
+            apu_reset();
+            apu_write(0x4015, 0x08);
+            apu_write(0x400C, 0x3F);
+            apu_write(0x400E, 0x04);
+            apu_write(0x400F, 0x08);
+            for (i = 0; i < 30; i++) {
+                snd_stream_poll(h);
+                vid_waitvbl();
+            }
+            snd_stream_stop(h);
+            snd_stream_destroy(h);
+        }
+        snd_stream_shutdown();
+        snd_shutdown();
+    }
+
+    apu_reset();
+
+    menu_clear();
+    menu_draw_str(200, "APU OK", 0);
+    for (i = 0; i < 40; i++) vid_waitvbl();
+    return 1;
+}
+
+static void run_diagnostics(void)
+{
+    char err[128];
+    int ok = 1;
+    const char *fail_msg = NULL;
+
+    err[0] = '\0';
+
+    if (!test_graphics(err, sizeof(err))) {
+        ok = 0;
+        fail_msg = err;
+        goto done;
+    }
+    if (!test_sound_system(err, sizeof(err))) {
+        ok = 0;
+        fail_msg = err;
+        goto done;
+    }
+    if (!test_apu(err, sizeof(err))) {
+        ok = 0;
+        fail_msg = err;
+        goto done;
+    }
+
+done:
+    menu_clear();
+    if (ok) {
+        menu_draw_str(200, "All done, it's fine.", 0);
+    } else {
+        menu_draw_str(160, "Abnormality detected:", 0);
+        menu_draw_str(200, fail_msg ? fail_msg : "Unknown error", 0);
+    }
+    menu_draw_str(300, "Press A / Start to continue", 0);
+    wait_button();
+}
+
+/* ---- main menu -------------------------------------------------------- */
+
+#define MENU_ITEMS 3
+static const char *menu_labels[MENU_ITEMS] = {
+    "Start Game",
+    "Test",
+    "Quit"
+};
+
+/*
+ * Blocks until Start Game or Quit.
  * Returns 1 = Start Game, 0 = Quit.
+ * Test is handled entirely inside and returns to the menu.
  */
 static int run_main_menu(void)
 {
@@ -152,9 +436,8 @@ static int run_main_menu(void)
     while (1) {
         uint8_t pad = read_pad(&quit_flag);
         if (quit_flag)
-            return 0;   /* force quit via button combo */
+            return 0;
 
-        /* rising-edge detection with a short debounce */
         if (debounce > 0) {
             debounce--;
         } else {
@@ -167,23 +450,29 @@ static int run_main_menu(void)
                 debounce = 12;
             }
             if ((pad & (PAD_A | PAD_START)) && !(prev & (PAD_A | PAD_START))) {
-                return (sel == 0) ? 1 : 0;   /* 1 = start, 0 = quit */
+                if (sel == 0)
+                    return 1;   /* Start Game */
+                if (sel == 2)
+                    return 0;   /* Quit */
+                /* sel == 1 → Test */
+                if (confirm_yes_no(
+                        "Are you sure you wanna test?",
+                        "It might look or sound creepy.")) {
+                    run_diagnostics();
+                }
+                /* after test (or No) fall back to menu */
+                prev = 0;
+                debounce = 12;
             }
         }
         prev = pad;
 
         menu_clear();
-
-        /* Title */
-        menu_draw_str(140, "Welcome to SMB for Dreamcast", 0);
-
-        /* Hint */
-        menu_draw_str(180, "A / Start = Select", 0);
-
-        /* Menu items */
-        menu_draw_str(260, menu_labels[0], sel == 0);
-        menu_draw_str(300, menu_labels[1], sel == 1);
-
+        menu_draw_str(120, "Welcome to SMB for Dreamcast", 0);
+        menu_draw_str(160, "A / Start = Select", 0);
+        menu_draw_str(240, menu_labels[0], sel == 0);
+        menu_draw_str(280, menu_labels[1], sel == 1);
+        menu_draw_str(320, menu_labels[2], sel == 2);
         vid_waitvbl();
     }
 }
