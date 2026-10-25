@@ -2,13 +2,13 @@
  * Super Mario Bros. for the Sega Dreamcast (KallistiOS).
  *
  * Runs the ROM built from the SMB disassembly (smb.nes in the romdisk) on the
- * portable NES core in this folder.  Video: the PPU's 256x240 output is uploaded
- * as a PVR texture and drawn as a quad (see INTEGER_SCALE).  Audio: AICA stream
+ * portable NES core in this folder. Video: the PPU's 256x240 output is uploaded
+ * as a PVR texture and drawn as a quad (see INTEGER_SCALE). Audio: AICA stream
  * whose callback pulls samples straight from the software APU.
  *
- * Controls:  D-pad / stick = move      A = jump      X or B = run / fireball
- *            Start = Start             Y = Select
- *            A + B + X + Y + Start     = exit to the BIOS
+ * Controls: D-pad / stick = move; A = jump; X or B = run / fireball
+ *           Start = Start; Y = Select
+ *           A + B + X + Y + Start = exit to the BIOS
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,40 +34,69 @@
 KOS_INIT_FLAGS(INIT_DEFAULT);
 
 #define TXR_BYTES        (256 * 256 * 2)
-#define AUDIO_BUF_BYTES  16384            /* AICA stream buffer: ~185 ms at 44.1 kHz mono */
+#define AUDIO_BUF_BYTES  16384
 #define STICK_DEADZONE   40
 
-/* 1 = sharp pixel-perfect 2x (512x480, black bars left/right, nearest filter)
- * 0 = stretched to the full 4:3 screen (bilinear, softer) */
+/* 1 = sharp 2x scale (512x480); 0 = full-screen stretch. */
 #define INTEGER_SCALE    1
 
-static uint16_t fb[256 * 256] __attribute__((aligned(32)));      /* PPU output, rows 0..239 used */
-static int16_t  abuf[AUDIO_BUF_BYTES / 2] __attribute__((aligned(32)));
+static uint16_t fb[256 * 256] __attribute__((aligned(32)));
+static int16_t abuf[AUDIO_BUF_BYTES / 2] __attribute__((aligned(32)));
 
-static void menu_init_font(void);   /* defined with menu helpers below */
+static void menu_init_font(void);
 
-/* KOS passes/expects BYTES here, even though the parameters are named smp_*. */
+/* KOS expects byte counts for this stream callback. */
 static void *audio_cb(snd_stream_hnd_t hnd, int req_bytes, int *got_bytes)
 {
     int n = req_bytes / 2;
     (void)hnd;
     if (n > AUDIO_BUF_BYTES / 2) n = AUDIO_BUF_BYTES / 2;
+    if (n < 0) n = 0;
     nes_audio_render(abuf, n);
     *got_bytes = n * 2;
     return abuf;
 }
 
+/* Robustly load a file; *size is always initialized. */
 static uint8_t *load_file(const char *path, size_t *size)
 {
-    FILE *f = fopen(path, "rb");
+    FILE *f;
     uint8_t *buf;
-    long sz;
+    long end;
+
+    if (size) *size = 0;
+    if (!path || !size) return NULL;
+
+    f = fopen(path, "rb");
     if (!f) return NULL;
-    fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
-    buf = (uint8_t *)malloc((size_t)sz);
-    if (buf && fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); buf = NULL; }
-    fclose(f);
-    *size = buf ? (size_t)sz : 0;
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    end = ftell(f);
+    if (end < 16 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+
+    buf = (uint8_t *)malloc((size_t)end);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+
+    if (fread(buf, 1, (size_t)end, f) != (size_t)end) {
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
+    if (fclose(f) != 0) {
+        free(buf);
+        return NULL;
+    }
+
+    *size = (size_t)end;
     return buf;
 }
 
@@ -81,7 +110,7 @@ static void fatal(const char *msg)
     for (i = 0; i < 60 * 8; i++) vid_waitvbl();
 }
 
-/* returns NES pad bits; sets *quit when the exit combo is held */
+/* Returns NES pad bits; sets *quit when the exit combo is held. */
 static uint8_t read_pad(int *quit)
 {
     maple_device_t *dev = maple_enum_type(0, MAPLE_FUNC_CONTROLLER);
@@ -90,7 +119,7 @@ static uint8_t read_pad(int *quit)
     const uint32_t combo = CONT_A | CONT_B | CONT_X | CONT_Y | CONT_START;
 
     if (!st) return 0;
-    if ((st->buttons & combo) == combo) *quit = 1;
+    if (quit && (st->buttons & combo) == combo) *quit = 1;
 
     if (st->buttons & CONT_A)               pad |= PAD_A;
     if (st->buttons & (CONT_X | CONT_B))    pad |= PAD_B;
@@ -107,7 +136,8 @@ static uint8_t read_pad(int *quit)
     return pad;
 }
 
-static void set_vertex(pvr_vertex_t *v, float x, float y, float u, float t, uint32_t flags)
+static void set_vertex(pvr_vertex_t *v, float x, float y, float u, float t,
+                       uint32_t flags)
 {
     v->flags = flags;
     v->x = x; v->y = y; v->z = 1.0f;
@@ -118,29 +148,23 @@ static void set_vertex(pvr_vertex_t *v, float x, float y, float u, float t, uint
 
 /* ---- menu helpers ----------------------------------------------------- */
 
-/* Pitch in pixels for the current framebuffer row */
 static int menu_pitch(void)
 {
     return (vid_mode && vid_mode->width) ? (int)vid_mode->width : 640;
 }
 
-/* Reset bfont to clean white-on-black (BIOS may leave garbage colors).
- * bfont_set_32bit_mode() is gone in current KOS; we always use PM_RGB565. */
 static void menu_init_font(void)
 {
     bfont_set_encoding(BFONT_CODE_ISO8859_1);
-    /* RGB565: white foreground, black background */
     bfont_set_foreground_color(0xFFFF);
     bfont_set_background_color(0x0000);
 }
 
 static void menu_clear(void)
 {
-    /* Prefer KOS clear (handles current FB / store queues) over fixed memset */
     vid_clear(0, 0, 0);
 }
 
-/* After a full paint on interlaced modes, wait 2 fields so both show the same frame. */
 static void menu_present(void)
 {
     vid_waitvbl();
@@ -155,24 +179,24 @@ static void menu_draw_str(int y, const char *str, int highlight)
     int x = (pitch - len * 12) / 2;
     if (x < 8) x = 8;
 
-    if (highlight)
-        bfont_draw_str(vram_s + y * pitch + (x - 16), pitch, true, ">");
+    if (highlight && x >= 16)
+        bfont_draw_str(vram_s + y * pitch + x - 16, pitch, true, ">");
     bfont_draw_str(vram_s + y * pitch + x, pitch, true, str);
 }
 
-/* Wait until A/Start is released then pressed again (or quit combo). */
+/* Wait until A/Start has been released and pressed again, or quit combo. */
 static void wait_button(void)
 {
     int quit_flag = 0;
     uint8_t prev = 0xFF;
     int released = 0;
 
-    while (1) {
+    for (;;) {
         uint8_t pad = read_pad(&quit_flag);
         if (quit_flag) return;
-        if (!(pad & (PAD_A | PAD_START)))
-            released = 1;
-        if (released && (pad & (PAD_A | PAD_START)) && !(prev & (PAD_A | PAD_START)))
+        if (!(pad & (PAD_A | PAD_START))) released = 1;
+        if (released && (pad & (PAD_A | PAD_START)) &&
+            !(prev & (PAD_A | PAD_START)))
             return;
         prev = pad;
         vid_waitvbl();
@@ -182,20 +206,18 @@ static void wait_button(void)
 /* Yes/No prompt. Returns 1 = Yes, 0 = No. */
 static int confirm_yes_no(const char *line1, const char *line2)
 {
-    int sel = 0;   /* 0 = No (safer default), 1 = Yes */
+    int sel = 0;
     int quit_flag = 0;
     uint8_t prev = 0;
     int debounce = 0;
-    int armed = 0; /* ignore buttons still held from the previous screen */
-    int dirty = 1; /* only clear/redraw when something changes (stops flicker) */
+    int armed = 0;
+    int dirty = 1;
 
     menu_init_font();
-
-    while (1) {
+    for (;;) {
         uint8_t pad = read_pad(&quit_flag);
         if (quit_flag) return 0;
 
-        /* Wait until A/Start/B are released before accepting input */
         if (!armed) {
             if (!(pad & (PAD_A | PAD_START | PAD_B))) {
                 armed = 1;
@@ -211,23 +233,20 @@ static int confirm_yes_no(const char *line1, const char *line2)
                 debounce = 12;
                 dirty = 1;
             }
-            if ((pad & (PAD_A | PAD_START)) && !(prev & (PAD_A | PAD_START))) {
-                return sel;   /* 1 = Yes, 0 = No */
-            }
-            if ((pad & PAD_B) && !(prev & PAD_B)) {
-                return 0;     /* B = cancel / No */
-            }
+            if ((pad & (PAD_A | PAD_START)) && !(prev & (PAD_A | PAD_START)))
+                return sel;
+            if ((pad & PAD_B) && !(prev & PAD_B))
+                return 0;
         }
         prev = pad;
 
         if (dirty) {
-            /* Paint during blanking; present waits 2 fields if interlaced */
             vid_waitvbl();
             menu_clear();
             if (line1) menu_draw_str(140, line1, 0);
             if (line2) menu_draw_str(170, line2, 0);
             menu_draw_str(240, "Yes", sel == 1);
-            menu_draw_str(280, "No",  sel == 0);
+            menu_draw_str(280, "No", sel == 0);
             menu_draw_str(340, "A/Start = OK   B = Cancel", 0);
             menu_present();
             dirty = 0;
@@ -239,14 +258,12 @@ static int confirm_yes_no(const char *line1, const char *line2)
 
 /* ---- self-test suite -------------------------------------------------- */
 
-#define RGB565(r, g, b) (uint16_t)(((r) >> 3) << 11 | ((g) >> 2) << 5 | ((b) >> 3))
+#define RGB565(r, g, b) ((uint16_t)((((r) >> 3) << 11) | (((g) >> 2) << 5) | ((b) >> 3)))
 
-/* Hold a still image for about `frames` vblanks. */
 static void menu_hold(int frames)
 {
     int i;
-    for (i = 0; i < frames; i++)
-        vid_waitvbl();
+    for (i = 0; i < frames; i++) vid_waitvbl();
 }
 
 static int test_graphics(char *err, size_t errsz)
@@ -254,8 +271,9 @@ static int test_graphics(char *err, size_t errsz)
     int x, y, pitch = menu_pitch();
     uint16_t *v = vram_s;
     uint16_t colors[8] = {
-        RGB565(255, 0, 0), RGB565(0, 255, 0), RGB565(0, 0, 255), RGB565(255, 255, 0),
-        RGB565(255, 0, 255), RGB565(0, 255, 255), RGB565(255, 255, 255), RGB565(0, 0, 0)
+        RGB565(255, 0, 0), RGB565(0, 255, 0), RGB565(0, 0, 255),
+        RGB565(255, 255, 0), RGB565(255, 0, 255), RGB565(0, 255, 255),
+        RGB565(255, 255, 255), RGB565(0, 0, 0)
     };
 
     menu_init_font();
@@ -264,26 +282,20 @@ static int test_graphics(char *err, size_t errsz)
     menu_draw_str(80, "Press A / Start to step", 0);
     menu_hold(90);
 
-    /* Color bars */
-    for (y = 80; y < 200; y++) {
-        for (x = 0; x < pitch; x++) {
+    for (y = 80; y < 200; y++)
+        for (x = 0; x < pitch; x++)
             v[y * pitch + x] = colors[(x * 8) / pitch];
-        }
-    }
     menu_draw_str(360, "Color bars  (A = next)", 0);
     wait_button();
 
-    /* Checkerboard */
-    for (y = 210; y < 340; y++) {
+    for (y = 210; y < 340; y++)
         for (x = 0; x < pitch; x++) {
             int c = ((x / 16) ^ (y / 16)) & 1;
             v[y * pitch + x] = c ? RGB565(200, 200, 200) : RGB565(40, 40, 40);
         }
-    }
     menu_draw_str(360, "Checkerboard  (A = next)", 0);
     wait_button();
 
-    /* Write/read-back check on a few pixels */
     v[100 * pitch + 100] = RGB565(123, 45, 67);
     v[200 * pitch + 300] = RGB565(10, 20, 30);
     if (v[100 * pitch + 100] != RGB565(123, 45, 67) ||
@@ -299,16 +311,6 @@ static int test_graphics(char *err, size_t errsz)
     return 1;
 }
 
-/*
- * BIOS assets + hardware authenticity test.
- *
- * Real Dreamcast BIOS exposes ROM font + flashrom via syscalls.
- * Emulators often load a BIOS image but still fail WDT (almost never emulated).
- * There is no KOS API to replay the official boot jingle from the BIOS ROM;
- * instead we prove BIOS/ROM access and real SH4 hardware.
- *
- * Returns 0 and sets err if we conclude this is likely an emulator / no BIOS.
- */
 static volatile int wdt_fired;
 
 static void wdt_test_cb(void *user)
@@ -317,6 +319,10 @@ static void wdt_test_cb(void *user)
     wdt_fired = 1;
 }
 
+/*
+ * BIOS asset and hardware test. WDT support can vary by emulator/KOS build,
+ * so failure is reported as a diagnostic rather than proof of emulation.
+ */
 static int test_bios_assets(char *err, size_t errsz)
 {
     int i, region;
@@ -331,23 +337,19 @@ static int test_bios_assets(char *err, size_t errsz)
     menu_draw_str(120, "Press A / Start to step", 0);
     menu_hold(90);
 
-    /* ---- 1) BIOS ROM font (actual BIOS asset) ---- */
     if (syscall_font_lock() != 0) {
-        snprintf(err, errsz, "Emulator?: BIOS font lock failed");
+        snprintf(err, errsz, "BIOS font lock failed");
         return 0;
     }
     font = syscall_font_address();
     if (!font) {
         syscall_font_unlock();
-        snprintf(err, errsz, "Emulator?: no BIOS ROM font");
+        snprintf(err, errsz, "No BIOS ROM font");
         return 0;
     }
-    /* Touch a few bytes so the read is real (not a fake non-NULL) */
-    for (i = 0; i < 16; i++)
-        probe[i] = font[i];
+    for (i = 0; i < 16; i++) probe[i] = font[i];
     syscall_font_unlock();
 
-    /* Must not be all 0x00 or all 0xFF (typical empty/missing dump) */
     {
         int all0 = 1, allf = 1;
         for (i = 0; i < 16; i++) {
@@ -355,27 +357,25 @@ static int test_bios_assets(char *err, size_t errsz)
             if (probe[i] != 0xFF) allf = 0;
         }
         if (all0 || allf) {
-            snprintf(err, errsz, "Emulator?: BIOS font data empty");
+            snprintf(err, errsz, "BIOS font data appears empty");
             return 0;
         }
     }
 
-    /* Show that we can draw with the BIOS font (visible asset) */
     menu_clear();
     menu_draw_str(100, "BIOS ROM font OK", 0);
     menu_draw_str(140, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 0);
-    menu_draw_str(180, "0123456789 !@#$%", 0);
+    menu_draw_str(180, "0123456789 !@#$%%", 0);
     menu_draw_str(260, "Press A / Start", 0);
     wait_button();
 
-    /* ---- 2) Flashrom system config (BIOS settings store) ---- */
     region = flashrom_get_region();
     if (region < 0) {
-        snprintf(err, errsz, "Emulator?: flashrom region failed");
+        snprintf(err, errsz, "Flashrom region failed");
         return 0;
     }
     if (flashrom_get_syscfg(&syscfg) < 0) {
-        snprintf(err, errsz, "Emulator?: flashrom syscfg failed");
+        snprintf(err, errsz, "Flashrom syscfg failed");
         return 0;
     }
 
@@ -389,71 +389,65 @@ static int test_bios_assets(char *err, size_t errsz)
     menu_draw_str(260, "Press A / Start", 0);
     wait_button();
 
-    /* ---- 3) AICA still required for "sound path alive" ---- */
     menu_clear();
     menu_draw_str(100, "Checking AICA sound path...", 0);
     menu_hold(60);
     if (snd_init() != 0) {
-        snprintf(err, errsz, "Sound: snd_init() failed");
+        snprintf(err, errsz, "snd_init() failed");
         return 0;
     }
     mem = snd_mem_available();
     if (mem == 0) {
         snd_shutdown();
-        snprintf(err, errsz, "Sound: no AICA RAM (emu?)");
+        snprintf(err, errsz, "No AICA RAM reported");
         return 0;
     }
     if (snd_stream_init() != 0) {
         snd_shutdown();
-        snprintf(err, errsz, "Sound: stream init failed");
+        snprintf(err, errsz, "Sound stream init failed");
         return 0;
     }
     snd_stream_shutdown();
     snd_shutdown();
 
-    /* ---- 4) SH4 Watchdog Timer — almost never emulated ---- */
     menu_clear();
-    menu_draw_str(100, "Checking WDT (hardware)...", 0);
+    menu_draw_str(100, "Checking WDT...", 0);
     menu_hold(60);
     wdt_fired = 0;
-    wdt_enable_timer(0, 1000, 15, wdt_test_cb, NULL); /* ~1 ms period */
-    thd_sleep(5);   /* wait well past one period */
+    wdt_enable_timer(0, 1000, 15, wdt_test_cb, NULL);
+    thd_sleep(5);
     wdt_disable();
 
     if (!wdt_fired) {
-        snprintf(err, errsz, "Emulator detected (WDT IRQ missing)");
+        snprintf(err, errsz, "WDT callback did not fire");
         return 0;
     }
 
     menu_clear();
-    menu_draw_str(200, "BIOS + hardware OK", 0);
+    menu_draw_str(200, "BIOS + hardware checks OK", 0);
     menu_draw_str(260, "Press A / Start", 0);
     wait_button();
     return 1;
 }
 
-/* Tiny stream callback used only during APU self-test */
 static int16_t test_tone_buf[1024];
+
 static void *test_apu_cb(snd_stream_hnd_t hnd, int req_bytes, int *got_bytes)
 {
     int n = req_bytes / 2;
     (void)hnd;
     if (n > 1024) n = 1024;
+    if (n < 0) n = 0;
     apu_generate(test_tone_buf, n);
     *got_bytes = n * 2;
     return test_tone_buf;
 }
 
-/*
- * APU self-test: program a short pulse tone, generate samples, check they
- * are neither silent nor stuck at full scale. Also plays them briefly.
- */
 static int test_apu(char *err, size_t errsz)
 {
     int16_t samples[2048];
-    int i, nonzero = 0, clipped = 0;
-    int maxabs = 0;
-    snd_stream_hnd_t h;
+    int i, nonzero = 0, clipped = 0, maxabs = 0;
+    snd_stream_hnd_t h = -1;
 
     menu_clear();
     menu_draw_str(40, "Testing APU...", 0);
@@ -462,70 +456,64 @@ static int test_apu(char *err, size_t errsz)
     wait_button();
 
     apu_reset();
-
-    /* Enable pulse 1, constant volume, duty 50%, period for ~440 Hz-ish */
-    apu_write(0x4015, 0x01);          /* enable pulse 1 */
-    apu_write(0x4000, 0xBF);          /* duty 2, const vol, vol=15 */
-    apu_write(0x4001, 0x08);          /* sweep off */
-    apu_write(0x4002, 0xFD);          /* timer low  (approx A4) */
-    apu_write(0x4003, 0x08);          /* timer high + length (len_tab[1]=254) */
-
+    apu_write(0x4015, 0x01);
+    apu_write(0x4000, 0xBF);
+    apu_write(0x4001, 0x08);
+    apu_write(0x4002, 0xFD);
+    apu_write(0x4003, 0x08);
     apu_generate(samples, 2048);
 
     for (i = 0; i < 2048; i++) {
-        int a = samples[i] < 0 ? -samples[i] : samples[i];
+        int a = samples[i] < 0 ? -(int)samples[i] : (int)samples[i];
         if (a > 50) nonzero++;
         if (a >= 30000) clipped++;
         if (a > maxabs) maxabs = a;
     }
-
     if (nonzero < 100) {
-        snprintf(err, errsz, "APU: output was silent (no tone)");
+        snprintf(err, errsz, "APU output was silent");
         apu_reset();
         return 0;
     }
     if (clipped > 1500) {
-        snprintf(err, errsz, "APU: output heavily clipped");
+        snprintf(err, errsz, "APU output heavily clipped");
         apu_reset();
         return 0;
     }
     if (maxabs < 100) {
-        snprintf(err, errsz, "APU: output level too low");
+        snprintf(err, errsz, "APU output level too low");
         apu_reset();
         return 0;
     }
 
-    /* Play the tone through AICA so it is audible (~1.5s pulse + ~1s noise) */
     if (snd_init() == 0) {
-        snd_stream_init();
-        h = snd_stream_alloc(test_apu_cb, 4096);
-        if (h >= 0) {
-            menu_clear();
-            menu_draw_str(200, "Playing pulse tone...", 0);
-            snd_stream_start(h, NES_AUDIO_RATE, 0);
-            for (i = 0; i < 90; i++) {   /* ~1.5 s */
-                snd_stream_poll(h);
-                vid_waitvbl();
+        if (snd_stream_init() == 0) {
+            h = snd_stream_alloc(test_apu_cb, 4096);
+            if (h >= 0) {
+                menu_clear();
+                menu_draw_str(200, "Playing pulse tone...", 0);
+                snd_stream_start(h, NES_AUDIO_RATE, 0);
+                for (i = 0; i < 90; i++) {
+                    snd_stream_poll(h);
+                    vid_waitvbl();
+                }
+                apu_reset();
+                apu_write(0x4015, 0x08);
+                apu_write(0x400C, 0x3F);
+                apu_write(0x400E, 0x04);
+                apu_write(0x400F, 0x18);
+                menu_clear();
+                menu_draw_str(200, "Playing noise...", 0);
+                for (i = 0; i < 60; i++) {
+                    snd_stream_poll(h);
+                    vid_waitvbl();
+                }
+                snd_stream_stop(h);
+                snd_stream_destroy(h);
             }
-            /* Switch to noise for a moment */
-            apu_reset();
-            apu_write(0x4015, 0x08);  /* enable noise */
-            apu_write(0x400C, 0x3F);  /* const vol, vol=15 */
-            apu_write(0x400E, 0x04);  /* period */
-            apu_write(0x400F, 0x18);  /* length index 3 → longer note */
-            menu_clear();
-            menu_draw_str(200, "Playing noise...", 0);
-            for (i = 0; i < 60; i++) {  /* ~1 s */
-                snd_stream_poll(h);
-                vid_waitvbl();
-            }
-            snd_stream_stop(h);
-            snd_stream_destroy(h);
+            snd_stream_shutdown();
         }
-        snd_stream_shutdown();
         snd_shutdown();
     }
-
     apu_reset();
 
     menu_clear();
@@ -535,10 +523,7 @@ static int test_apu(char *err, size_t errsz)
     return 1;
 }
 
-/*
- * Tribute bumper inspired by classic DC scene diagnostics ("CN Check It 1.0").
- * Not a byte-accurate rip — a short splash + beeps after the 3D PVR test.
- */
+/* Short original tribute bumper; not a byte-accurate asset rip. */
 static void checkit_bumper(void)
 {
     int i;
@@ -547,8 +532,6 @@ static void checkit_bumper(void)
     menu_init_font();
     menu_clear();
     menu_hold(20);
-
-    /* Title card */
     menu_clear();
     menu_draw_str(140, "CN", 0);
     menu_draw_str(200, "CHECK IT", 0);
@@ -556,39 +539,34 @@ static void checkit_bumper(void)
     menu_draw_str(340, "PVR 3D  OK", 0);
     menu_hold(30);
 
-    /* Short APU jingle (pulse arpeggio) while the card stays up */
     if (snd_init() == 0) {
-        snd_stream_init();
-        h = snd_stream_alloc(test_apu_cb, 4096);
-        if (h >= 0) {
-            static const struct { uint8_t lo; uint8_t hi; int frames; } notes[] = {
-                { 0xFD, 0x00, 12 }, /* A4-ish */
-                { 0xC9, 0x00, 12 }, /* C5 */
-                { 0xA9, 0x00, 12 }, /* E5 */
-                { 0x7F, 0x00, 18 }, /* A5 */
-                { 0xA9, 0x00, 10 },
-                { 0x7F, 0x00, 24 },
-            };
-            snd_stream_start(h, NES_AUDIO_RATE, 0);
-            for (i = 0; i < (int)(sizeof(notes) / sizeof(notes[0])); i++) {
-                apu_reset();
-                apu_write(0x4015, 0x01);
-                apu_write(0x4000, 0xBF);
-                apu_write(0x4001, 0x08);
-                apu_write(0x4002, notes[i].lo);
-                apu_write(0x4003, notes[i].hi | 0x08);
-                {
+        if (snd_stream_init() == 0) {
+            h = snd_stream_alloc(test_apu_cb, 4096);
+            if (h >= 0) {
+                static const struct { uint8_t lo; uint8_t hi; int frames; } notes[] = {
+                    { 0xFD, 0x00, 12 }, { 0xC9, 0x00, 12 },
+                    { 0xA9, 0x00, 12 }, { 0x7F, 0x00, 18 },
+                    { 0xA9, 0x00, 10 }, { 0x7F, 0x00, 24 }
+                };
+                snd_stream_start(h, NES_AUDIO_RATE, 0);
+                for (i = 0; i < (int)(sizeof(notes) / sizeof(notes[0])); i++) {
                     int f;
+                    apu_reset();
+                    apu_write(0x4015, 0x01);
+                    apu_write(0x4000, 0xBF);
+                    apu_write(0x4001, 0x08);
+                    apu_write(0x4002, notes[i].lo);
+                    apu_write(0x4003, notes[i].hi | 0x08);
                     for (f = 0; f < notes[i].frames; f++) {
                         snd_stream_poll(h);
                         vid_waitvbl();
                     }
                 }
+                snd_stream_stop(h);
+                snd_stream_destroy(h);
             }
-            snd_stream_stop(h);
-            snd_stream_destroy(h);
+            snd_stream_shutdown();
         }
-        snd_stream_shutdown();
         snd_shutdown();
         apu_reset();
     }
@@ -598,24 +576,23 @@ static void checkit_bumper(void)
     wait_button();
 }
 
-/* Simple rotating cube via PVR — proves TA/ISP/TSP path is alive. */
+/* Rotating cube through PVR proves the 3D command path is alive. */
 static int test_3d_graphics(char *err, size_t errsz)
 {
-    int i, frames = 180; /* ~3 seconds of spin, then bumper */
+    int i, frames = 180;
     float angle = 0.0f;
     pvr_poly_cxt_t cxt;
     pvr_poly_hdr_t hdr;
     int quit_flag = 0;
 
-    (void)errsz;
     menu_init_font();
     menu_clear();
     menu_draw_str(40, "Testing 3D (PVR)...", 0);
-    menu_draw_str(80, "Rotating cube — A skips", 0);
+    menu_draw_str(80, "Rotating cube - A skips", 0);
     menu_hold(60);
 
     if (pvr_init_defaults() != 0) {
-        snprintf(err, errsz, "3D: pvr_init_defaults failed");
+        snprintf(err, errsz, "pvr_init_defaults failed");
         return 0;
     }
 
@@ -625,23 +602,21 @@ static int test_3d_graphics(char *err, size_t errsz)
     for (i = 0; i < frames; i++) {
         float c = cosf(angle), s = sinf(angle);
         float c2 = cosf(angle * 0.7f), s2 = sinf(angle * 0.7f);
-        /* 8 cube corners, then rotate around Y then X */
         float pts[8][3];
         static const float base[8][3] = {
-            {-1,-1,-1},{ 1,-1,-1},{ 1, 1,-1},{-1, 1,-1},
-            {-1,-1, 1},{ 1,-1, 1},{ 1, 1, 1},{-1, 1, 1}
+            {-1,-1,-1}, {1,-1,-1}, {1,1,-1}, {-1,1,-1},
+            {-1,-1,1}, {1,-1,1}, {1,1,1}, {-1,1,1}
         };
-        int v;
-        pvr_vertex_t vert;
-        /* face indices (quads as two triangles each) */
         static const int faces[6][4] = {
-            {0,1,2,3},{5,4,7,6},{4,0,3,7},{1,5,6,2},{3,2,6,7},{4,5,1,0}
+            {0,1,2,3}, {5,4,7,6}, {4,0,3,7},
+            {1,5,6,2}, {3,2,6,7}, {4,5,1,0}
         };
         static const uint32_t fcol[6] = {
             0xFFFF0000, 0xFF00FF00, 0xFF0000FF,
             0xFFFFFF00, 0xFFFF00FF, 0xFF00FFFF
         };
-        int f;
+        int v, f;
+        pvr_vertex_t vert;
 
         for (v = 0; v < 8; v++) {
             float x = base[v][0], y = base[v][1], z = base[v][2];
@@ -660,8 +635,9 @@ static int test_3d_graphics(char *err, size_t errsz)
         pvr_prim(&hdr, sizeof(hdr));
 
         for (f = 0; f < 6; f++) {
-            int a = faces[f][0], b = faces[f][1], cidx = faces[f][2], d = faces[f][3];
-            /* triangle 1 */
+            int a = faces[f][0], b = faces[f][1];
+            int ci = faces[f][2], d = faces[f][3];
+
             vert.flags = PVR_CMD_VERTEX;
             vert.x = pts[a][0]; vert.y = pts[a][1]; vert.z = pts[a][2];
             vert.u = 0; vert.v = 0; vert.argb = fcol[f]; vert.oargb = 0;
@@ -669,13 +645,13 @@ static int test_3d_graphics(char *err, size_t errsz)
             vert.x = pts[b][0]; vert.y = pts[b][1]; vert.z = pts[b][2];
             pvr_prim(&vert, sizeof(vert));
             vert.flags = PVR_CMD_VERTEX_EOL;
-            vert.x = pts[cidx][0]; vert.y = pts[cidx][1]; vert.z = pts[cidx][2];
+            vert.x = pts[ci][0]; vert.y = pts[ci][1]; vert.z = pts[ci][2];
             pvr_prim(&vert, sizeof(vert));
-            /* triangle 2 */
+
             vert.flags = PVR_CMD_VERTEX;
             vert.x = pts[a][0]; vert.y = pts[a][1]; vert.z = pts[a][2];
             pvr_prim(&vert, sizeof(vert));
-            vert.x = pts[cidx][0]; vert.y = pts[cidx][1]; vert.z = pts[cidx][2];
+            vert.x = pts[ci][0]; vert.y = pts[ci][1]; vert.z = pts[ci][2];
             pvr_prim(&vert, sizeof(vert));
             vert.flags = PVR_CMD_VERTEX_EOL;
             vert.x = pts[d][0]; vert.y = pts[d][1]; vert.z = pts[d][2];
@@ -684,18 +660,15 @@ static int test_3d_graphics(char *err, size_t errsz)
 
         pvr_list_finish();
         pvr_scene_finish();
-
         angle += 0.04f;
         if (angle > 6.28318f) angle -= 6.28318f;
 
         read_pad(&quit_flag);
-        if (quit_flag)
-            break;
+        if (quit_flag) break;
         {
             maple_device_t *dev = maple_enum_type(0, MAPLE_FUNC_CONTROLLER);
             cont_state_t *st = dev ? (cont_state_t *)maple_dev_status(dev) : NULL;
             if (st && (st->buttons & (CONT_A | CONT_START))) {
-                /* wait release so bumper doesn't skip */
                 while (st && (st->buttons & (CONT_A | CONT_START))) {
                     vid_waitvbl();
                     st = (cont_state_t *)maple_dev_status(dev);
@@ -706,8 +679,6 @@ static int test_3d_graphics(char *err, size_t errsz)
     }
 
     pvr_shutdown();
-
-    /* Restore 2D framebuffer path for bumper + later tests */
     {
         int cable = vid_check_cable();
         int dm = (cable == CT_VGA) ? DM_640x480_VGA : DM_640x480_NTSC_IL;
@@ -716,7 +687,6 @@ static int test_3d_graphics(char *err, size_t errsz)
         menu_init_font();
         menu_hold(4);
     }
-
     checkit_bumper();
     return 1;
 }
@@ -728,26 +698,17 @@ static void run_diagnostics(void)
     const char *fail_msg = NULL;
 
     err[0] = '\0';
-
     if (!test_graphics(err, sizeof(err))) {
-        ok = 0;
-        fail_msg = err;
-        goto done;
+        ok = 0; fail_msg = err; goto done;
     }
     if (!test_3d_graphics(err, sizeof(err))) {
-        ok = 0;
-        fail_msg = err;
-        goto done;
+        ok = 0; fail_msg = err; goto done;
     }
     if (!test_bios_assets(err, sizeof(err))) {
-        ok = 0;
-        fail_msg = err;
-        goto done;
+        ok = 0; fail_msg = err; goto done;
     }
     if (!test_apu(err, sizeof(err))) {
-        ok = 0;
-        fail_msg = err;
-        goto done;
+        ok = 0; fail_msg = err; goto done;
     }
 
 done:
@@ -757,7 +718,6 @@ done:
     } else {
         menu_draw_str(140, "Abnormality detected:", 0);
         menu_draw_str(180, fail_msg ? fail_msg : "Unknown error", 0);
-        /* Hint when BIOS/WDT path failed */
         if (fail_msg && (strstr(fail_msg, "Emulator") || strstr(fail_msg, "BIOS")))
             menu_draw_str(240, "Assuming emulator / no real BIOS", 0);
     }
@@ -769,30 +729,21 @@ done:
 
 #define MENU_ITEMS 3
 static const char *menu_labels[MENU_ITEMS] = {
-    "Start Game",
-    "Test",
-    "Quit"
+    "Start Game", "Test", "Quit"
 };
 
-/*
- * Blocks until Start Game or Quit.
- * Returns 1 = Start Game, 0 = Quit.
- * Test is handled entirely inside and returns to the menu.
- */
 static int run_main_menu(void)
 {
     int sel = 0;
     int quit_flag = 0;
     uint8_t prev = 0;
     int debounce = 0;
-    int dirty = 1; /* only redraw when selection changes */
+    int dirty = 1;
 
     menu_init_font();
-
-    while (1) {
+    for (;;) {
         uint8_t pad = read_pad(&quit_flag);
-        if (quit_flag)
-            return 0;
+        if (quit_flag) return 0;
 
         if (debounce > 0) {
             debounce--;
@@ -808,17 +759,12 @@ static int run_main_menu(void)
                 dirty = 1;
             }
             if ((pad & (PAD_A | PAD_START)) && !(prev & (PAD_A | PAD_START))) {
-                if (sel == 0)
-                    return 1;   /* Start Game */
-                if (sel == 2)
-                    return 0;   /* Quit */
-                /* sel == 1 → Test */
-                if (confirm_yes_no(
-                        "Are you sure you wanna test?",
-                        "It might look or sound creepy.")) {
+                if (sel == 0) return 1;
+                if (sel == 2) return 0;
+                if (confirm_yes_no("Are you sure you wanna test?",
+                                   "It might look or sound creepy.")) {
                     run_diagnostics();
                 }
-                /* after test (or No) fall back to menu — force redraw */
                 prev = 0;
                 debounce = 12;
                 dirty = 1;
@@ -827,7 +773,6 @@ static int run_main_menu(void)
         prev = pad;
 
         if (dirty) {
-            /* Paint during vblank; present settles both interlaced fields */
             vid_waitvbl();
             menu_clear();
             menu_draw_str(120, "Welcome to SMB for Dreamcast", 0);
@@ -853,45 +798,59 @@ int main(int argc, char **argv)
     pvr_vertex_t vert[4];
     snd_stream_hnd_t stream;
     int quit = 0;
-    (void)argc; (void)argv;
 
-    /* 60 Hz output on every cable (PAL consoles use NTSC-60 interlaced on composite/RGB).
-     * When launched from the official BIOS CD menu, VRAM and bfont state are dirty —
-     * fully re-init video, wipe VRAM, then force clean font colors. */
+    (void)argc;
+    (void)argv;
+
+    /* Reset video state after returning from the official BIOS menu. */
     {
         int i;
         int cable = vid_check_cable();
         int dm = (cable == CT_VGA) ? DM_640x480_VGA : DM_640x480_NTSC_IL;
         vid_set_mode(dm, PM_RGB565);
-        vid_empty();                 /* wipe all of VRAM (BIOS leftovers) */
-        vid_set_mode(dm, PM_RGB565); /* re-apply mode after empty */
+        vid_empty();
+        vid_set_mode(dm, PM_RGB565);
         vid_border_color(0, 0, 0);
         vid_clear(0, 0, 0);
         menu_init_font();
-        /* Extra frames so both interlaced fields + DAC settle after BIOS */
-        for (i = 0; i < 8; i++)
-            vid_waitvbl();
+        for (i = 0; i < 8; i++) vid_waitvbl();
     }
 
-    /* ---- Main menu (before ROM / PVR / audio) ---- */
-    if (!run_main_menu()) {
-        return 0;   /* player chose Quit */
-    }
+    if (!run_main_menu()) return 0;
 
     rom = load_file("/rd/smb.nes", &rom_size);
-    if (!rom)                                         { fatal("smb.nes missing from romdisk"); return 1; }
-    if (nes_load(rom, rom_size) != 0)                 { fatal("smb.nes is not a valid NROM image"); return 1; }
+    if (!rom) {
+        fatal("smb.nes missing from romdisk");
+        return 1;
+    }
+    if (nes_load(rom, rom_size) != 0) {
+        free(rom);
+        fatal("smb.nes is not a valid NROM image");
+        return 1;
+    }
     nes_reset();
 
-    pvr_init_defaults();
+    if (pvr_init_defaults() != 0) {
+        free(rom);
+        fatal("PVR initialization failed");
+        return 1;
+    }
     txr = pvr_mem_malloc(TXR_BYTES);
-    pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED,
-                     256, 256, txr, INTEGER_SCALE ? PVR_FILTER_NEAREST : PVR_FILTER_BILINEAR);
+    if (!txr) {
+        pvr_shutdown();
+        free(rom);
+        fatal("PVR texture allocation failed");
+        return 1;
+    }
+
+    pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY,
+                     PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED,
+                     256, 256, txr,
+                     INTEGER_SCALE ? PVR_FILTER_NEAREST : PVR_FILTER_BILINEAR);
     pvr_poly_compile(&hdr, &cxt);
 
-    /* quad; the texture is 256x256 but only the top 240 rows hold picture */
     {
-        float x0 = INTEGER_SCALE ?  64.0f :   0.0f;
+        float x0 = INTEGER_SCALE ? 64.0f : 0.0f;
         float x1 = INTEGER_SCALE ? 576.0f : 640.0f;
         set_vertex(&vert[0], x0,   0.0f, 0.0f, 0.0f,          PVR_CMD_VERTEX);
         set_vertex(&vert[1], x1,   0.0f, 1.0f, 0.0f,          PVR_CMD_VERTEX);
@@ -899,8 +858,22 @@ int main(int argc, char **argv)
         set_vertex(&vert[3], x1, 480.0f, 1.0f, 240.0f/256.0f, PVR_CMD_VERTEX_EOL);
     }
 
-    snd_stream_init();
+    if (snd_stream_init() != 0) {
+        pvr_mem_free(txr);
+        pvr_shutdown();
+        free(rom);
+        fatal("Audio stream initialization failed");
+        return 1;
+    }
     stream = snd_stream_alloc(audio_cb, AUDIO_BUF_BYTES);
+    if (stream < 0) {
+        snd_stream_shutdown();
+        pvr_mem_free(txr);
+        pvr_shutdown();
+        free(rom);
+        fatal("Audio stream allocation failed");
+        return 1;
+    }
     snd_stream_start(stream, NES_AUDIO_RATE, 0);
 
     while (!quit) {
@@ -908,10 +881,9 @@ int main(int argc, char **argv)
         nes_run_frame(fb);
         snd_stream_poll(stream);
 
-        pvr_wait_render_done();                  /* don't overwrite the texture mid-render */
+        pvr_wait_render_done();
         pvr_txr_load(fb, txr, TXR_BYTES);
-
-        pvr_wait_ready();                        /* paces the loop to the display refresh */
+        pvr_wait_ready();
         pvr_scene_begin();
         pvr_list_begin(PVR_LIST_OP_POLY);
         pvr_prim(&hdr, sizeof(hdr));
@@ -931,4 +903,5 @@ int main(int argc, char **argv)
     free(rom);
     return 0;
 }
+
 /* I'M TIRED OF THIS GRANDPA! WELL THAT'S TOO DAMN BAD!!*/
