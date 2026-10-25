@@ -117,17 +117,16 @@ static void set_vertex(pvr_vertex_t *v, float x, float y, float u, float t, uint
 
 /* ---- menu helpers ----------------------------------------------------- */
 
-/* Pitch in pixels for the current framebuffer row */
 static int menu_pitch(void)
 {
     return (vid_mode && vid_mode->width) ? (int)vid_mode->width : 640;
 }
 
-/* Reset bfont to clean 16-bit white-on-black (BIOS may leave garbage colors) */
+/* Reset bfont to clean white-on-black (BIOS may leave garbage colors).
+ * bfont_set_32bit_mode() is gone in current KOS; we always use PM_RGB565. */
 static void menu_init_font(void)
 {
     bfont_set_encoding(BFONT_CODE_ISO8859_1);
-    bfont_set_32bit_mode(0);
     /* RGB565: white foreground, black background */
     bfont_set_foreground_color(0xFFFF);
     bfont_set_background_color(0x0000);
@@ -135,7 +134,6 @@ static void menu_init_font(void)
 
 static void menu_clear(void)
 {
-    /* Prefer KOS clear (handles current FB / store queues) over fixed memset */
     vid_clear(0, 0, 0);
 }
 
@@ -151,13 +149,6 @@ static void menu_draw_str(int y, const char *str, int highlight)
     bfont_draw_str(vram_s + y * pitch + x, pitch, true, str);
 }
 
-static void menu_draw_str_left(int y, int x, const char *str)
-{
-    int pitch = menu_pitch();
-    bfont_draw_str(vram_s + y * pitch + x, pitch, true, str);
-}
-
-/* Wait until A/Start is released then pressed again (or quit combo). */
 static void wait_button(void)
 {
     int quit_flag = 0;
@@ -176,14 +167,13 @@ static void wait_button(void)
     }
 }
 
-/* Yes/No prompt. Returns 1 = Yes, 0 = No. */
 static int confirm_yes_no(const char *line1, const char *line2)
 {
-    int sel = 0;   /* 0 = No (safer default), 1 = Yes */
+    int sel = 0;
     int quit_flag = 0;
     uint8_t prev = 0;
     int debounce = 0;
-    int armed = 0; /* ignore buttons still held from the previous screen */
+    int armed = 0;
 
     menu_init_font();
 
@@ -191,7 +181,6 @@ static int confirm_yes_no(const char *line1, const char *line2)
         uint8_t pad = read_pad(&quit_flag);
         if (quit_flag) return 0;
 
-        /* Wait until A/Start/B are released before accepting input */
         if (!armed) {
             if (!(pad & (PAD_A | PAD_START | PAD_B)))
                 armed = 1;
@@ -215,10 +204,10 @@ static int confirm_yes_no(const char *line1, const char *line2)
                 debounce = 12;
             }
             if ((pad & (PAD_A | PAD_START)) && !(prev & (PAD_A | PAD_START))) {
-                return sel;   /* 1 = Yes, 0 = No */
+                return sel;
             }
             if ((pad & PAD_B) && !(prev & PAD_B)) {
-                return 0;     /* B = cancel / No */
+                return 0;
             }
         }
         prev = pad;
@@ -251,7 +240,6 @@ static int test_graphics(char *err, size_t errsz)
     menu_draw_str(40, "Testing graphics...", 0);
     vid_waitvbl();
 
-    /* Color bars */
     for (y = 80; y < 200; y++) {
         for (x = 0; x < pitch; x++) {
             v[y * pitch + x] = colors[(x * 8) / pitch];
@@ -259,7 +247,6 @@ static int test_graphics(char *err, size_t errsz)
     }
     for (y = 0; y < 30; y++) vid_waitvbl();
 
-    /* Checkerboard */
     for (y = 210; y < 340; y++) {
         for (x = 0; x < pitch; x++) {
             int c = ((x / 16) ^ (y / 16)) & 1;
@@ -268,7 +255,6 @@ static int test_graphics(char *err, size_t errsz)
     }
     for (y = 0; y < 30; y++) vid_waitvbl();
 
-    /* Write/read-back check on a few pixels */
     v[100 * pitch + 100] = RGB565(123, 45, 67);
     v[200 * pitch + 300] = RGB565(10, 20, 30);
     if (v[100 * pitch + 100] != RGB565(123, 45, 67) ||
@@ -283,16 +269,6 @@ static int test_graphics(char *err, size_t errsz)
     return 1;
 }
 
-/*
- * BIOS assets + hardware authenticity test.
- *
- * Real Dreamcast BIOS exposes ROM font + flashrom via syscalls.
- * Emulators often load a BIOS image but still fail WDT (almost never emulated).
- * There is no KOS API to replay the official boot jingle from the BIOS ROM;
- * instead we prove BIOS/ROM access and real SH4 hardware.
- *
- * Returns 0 and sets err if we conclude this is likely an emulator / no BIOS.
- */
 static volatile int wdt_fired;
 
 static void wdt_test_cb(void *user)
@@ -314,7 +290,6 @@ static int test_bios_assets(char *err, size_t errsz)
     menu_draw_str(80, "(ROM font / flashrom / WDT)", 0);
     vid_waitvbl();
 
-    /* ---- 1) BIOS ROM font (actual BIOS asset) ---- */
     if (syscall_font_lock() != 0) {
         snprintf(err, errsz, "Emulator?: BIOS font lock failed");
         return 0;
@@ -325,12 +300,10 @@ static int test_bios_assets(char *err, size_t errsz)
         snprintf(err, errsz, "Emulator?: no BIOS ROM font");
         return 0;
     }
-    /* Touch a few bytes so the read is real (not a fake non-NULL) */
     for (i = 0; i < 16; i++)
         probe[i] = font[i];
     syscall_font_unlock();
 
-    /* Must not be all 0x00 or all 0xFF (typical empty/missing dump) */
     {
         int all0 = 1, allf = 1;
         for (i = 0; i < 16; i++) {
@@ -343,14 +316,12 @@ static int test_bios_assets(char *err, size_t errsz)
         }
     }
 
-    /* Show that we can draw with the BIOS font (visible asset) */
     menu_clear();
     menu_draw_str(100, "BIOS ROM font OK", 0);
     menu_draw_str(140, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 0);
     menu_draw_str(180, "0123456789 !@#$%", 0);
     for (i = 0; i < 45; i++) vid_waitvbl();
 
-    /* ---- 2) Flashrom system config (BIOS settings store) ---- */
     region = flashrom_get_region();
     if (region < 0) {
         snprintf(err, errsz, "Emulator?: flashrom region failed");
@@ -370,7 +341,6 @@ static int test_bios_assets(char *err, size_t errsz)
     }
     for (i = 0; i < 40; i++) vid_waitvbl();
 
-    /* ---- 3) AICA still required for "sound path alive" ---- */
     if (snd_init() != 0) {
         snprintf(err, errsz, "Sound: snd_init() failed");
         return 0;
@@ -389,10 +359,9 @@ static int test_bios_assets(char *err, size_t errsz)
     snd_stream_shutdown();
     snd_shutdown();
 
-    /* ---- 4) SH4 Watchdog Timer — almost never emulated ---- */
     wdt_fired = 0;
-    wdt_enable_timer(0, 1000, 15, wdt_test_cb, NULL); /* \~1 ms period */
-    thd_sleep(5);   /* wait well past one period */
+    wdt_enable_timer(0, 1000, 15, wdt_test_cb, NULL);
+    thd_sleep(5);
     wdt_disable();
 
     if (!wdt_fired) {
@@ -406,7 +375,6 @@ static int test_bios_assets(char *err, size_t errsz)
     return 1;
 }
 
-/* Tiny stream callback used only during APU self-test */
 static int16_t test_tone_buf[1024];
 static void *test_apu_cb(snd_stream_hnd_t hnd, int req_bytes, int *got_bytes)
 {
@@ -418,10 +386,6 @@ static void *test_apu_cb(snd_stream_hnd_t hnd, int req_bytes, int *got_bytes)
     return test_tone_buf;
 }
 
-/*
- * APU self-test: program a short pulse tone, generate samples, check they
- * are neither silent nor stuck at full scale. Also plays them briefly.
- */
 static int test_apu(char *err, size_t errsz)
 {
     int16_t samples[2048];
@@ -436,12 +400,11 @@ static int test_apu(char *err, size_t errsz)
 
     apu_reset();
 
-    /* Enable pulse 1, constant volume, duty 50%, period for \~440 Hz-ish */
-    apu_write(0x4015, 0x01);          /* enable pulse 1 */
-    apu_write(0x4000, 0xBF);          /* duty 2, const vol, vol=15 */
-    apu_write(0x4001, 0x08);          /* sweep off */
-    apu_write(0x4002, 0xFD);          /* timer low  (approx A4) */
-    apu_write(0x4003, 0x08);          /* timer high + length (len_tab[1]=254) */
+    apu_write(0x4015, 0x01);
+    apu_write(0x4000, 0xBF);
+    apu_write(0x4001, 0x08);
+    apu_write(0x4002, 0xFD);
+    apu_write(0x4003, 0x08);
 
     apu_generate(samples, 2048);
 
@@ -468,22 +431,20 @@ static int test_apu(char *err, size_t errsz)
         return 0;
     }
 
-    /* Play the tone through AICA so it is audible */
     if (snd_init() == 0) {
         snd_stream_init();
         h = snd_stream_alloc(test_apu_cb, 4096);
         if (h >= 0) {
             snd_stream_start(h, NES_AUDIO_RATE, 0);
-            for (i = 0; i < 45; i++) {   /* \~0.75 s */
+            for (i = 0; i < 45; i++) {
                 snd_stream_poll(h);
                 vid_waitvbl();
             }
-            /* Switch to noise for a moment */
             apu_reset();
-            apu_write(0x4015, 0x08);  /* enable noise */
-            apu_write(0x400C, 0x3F);  /* const vol, vol=15 */
-            apu_write(0x400E, 0x04);  /* period */
-            apu_write(0x400F, 0x18);  /* length index 3 → longer note */
+            apu_write(0x4015, 0x08);
+            apu_write(0x400C, 0x3F);
+            apu_write(0x400E, 0x04);
+            apu_write(0x400F, 0x18);
             for (i = 0; i < 30; i++) {
                 snd_stream_poll(h);
                 vid_waitvbl();
@@ -534,7 +495,6 @@ done:
     } else {
         menu_draw_str(140, "Abnormality detected:", 0);
         menu_draw_str(180, fail_msg ? fail_msg : "Unknown error", 0);
-        /* Hint when BIOS/WDT path failed */
         if (fail_msg && (strstr(fail_msg, "Emulator") || strstr(fail_msg, "BIOS")))
             menu_draw_str(240, "Assuming emulator / no real BIOS", 0);
     }
@@ -551,11 +511,6 @@ static const char *menu_labels[MENU_ITEMS] = {
     "Quit"
 };
 
-/*
- * Blocks until Start Game or Quit.
- * Returns 1 = Start Game, 0 = Quit.
- * Test is handled entirely inside and returns to the menu.
- */
 static int run_main_menu(void)
 {
     int sel = 0;
@@ -583,16 +538,14 @@ static int run_main_menu(void)
             }
             if ((pad & (PAD_A | PAD_START)) && !(prev & (PAD_A | PAD_START))) {
                 if (sel == 0)
-                    return 1;   /* Start Game */
+                    return 1;
                 if (sel == 2)
-                    return 0;   /* Quit */
-                /* sel == 1 → Test */
+                    return 0;
                 if (confirm_yes_no(
                         "Are you sure you wanna test?",
                         "It might look or sound creepy.")) {
                     run_diagnostics();
                 }
-                /* after test (or No) fall back to menu */
                 prev = 0;
                 debounce = 12;
             }
@@ -621,24 +574,20 @@ int main(int argc, char **argv)
     int quit = 0;
     (void)argc; (void)argv;
 
-    /* 60 Hz output on every cable (PAL consoles use NTSC-60 interlaced on composite/RGB).
-     * When launched from the official BIOS CD menu, VRAM and bfont state are dirty —
-     * fully re-init video, wipe VRAM, then force clean 16-bit font colors. */
     {
         int i;
         int dm = (vid_check_cable() == CT_VGA) ? DM_640x480_VGA : DM_640x480_NTSC_IL;
         vid_set_mode(dm, PM_RGB565);
-        vid_empty();                 /* wipe all of VRAM (BIOS leftovers) */
-        vid_set_mode(dm, PM_RGB565); /* re-apply mode after empty */
+        vid_empty();
+        vid_set_mode(dm, PM_RGB565);
         vid_clear(0, 0, 0);
         menu_init_font();
         for (i = 0; i < 4; i++)
             vid_waitvbl();
     }
 
-    /* ---- Main menu (before ROM / PVR / audio) ---- */
     if (!run_main_menu()) {
-        return 0;   /* player chose Quit */
+        return 0;
     }
 
     rom = load_file("/rd/smb.nes", &rom_size);
@@ -652,7 +601,6 @@ int main(int argc, char **argv)
                      256, 256, txr, INTEGER_SCALE ? PVR_FILTER_NEAREST : PVR_FILTER_BILINEAR);
     pvr_poly_compile(&hdr, &cxt);
 
-    /* quad; the texture is 256x256 but only the top 240 rows hold picture */
     {
         float x0 = INTEGER_SCALE ?  64.0f :   0.0f;
         float x1 = INTEGER_SCALE ? 576.0f : 640.0f;
@@ -671,10 +619,10 @@ int main(int argc, char **argv)
         nes_run_frame(fb);
         snd_stream_poll(stream);
 
-        pvr_wait_render_done();                  /* don't overwrite the texture mid-render */
+        pvr_wait_render_done();
         pvr_txr_load(fb, txr, TXR_BYTES);
 
-        pvr_wait_ready();                        /* paces the loop to the display refresh */
+        pvr_wait_ready();
         pvr_scene_begin();
         pvr_list_begin(PVR_LIST_OP_POLY);
         pvr_prim(&hdr, sizeof(hdr));
@@ -694,4 +642,3 @@ int main(int argc, char **argv)
     free(rom);
     return 0;
 }
-/* I'M TIRED OF THIS GRANDPA! WELL THAT'S TOO DAMN BAD!!*/
