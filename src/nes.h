@@ -28,6 +28,11 @@ void    nes_run_frame(uint16_t *fb);
 void    nes_audio_render(int16_t *dst, int n);
 uint8_t nes_peek_ram(uint16_t addr);
 
+/* NES Game Genie cheats. Codes are 6 or 8 characters; returns 0 on success. */
+void    nes_game_genie_clear(void);
+int     nes_game_genie_add(const char *code);
+int     nes_game_genie_count(void);
+
 /* ---- internal (shared between the core's .c files) --------------------- */
 extern uint8_t        nes_ram[0x800];
 extern const uint8_t *nes_prg;
