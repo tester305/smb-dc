@@ -76,3 +76,4 @@ void nes_run_frame(uint16_t *fb)
 }
 
 void nes_audio_render(int16_t *dst, int n) { apu_generate(dst, n); }
+
