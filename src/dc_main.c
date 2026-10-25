@@ -28,6 +28,7 @@
 #include <dc/flashrom.h>
 #include <dc/syscalls.h>
 #include <dc/wdt.h>
+#include <dc/vmu_pkg.h>
 
 #include "nes.h"
 
@@ -679,13 +680,116 @@ done:
 #define MAX_CHEATS       32
 #define MAX_CHEAT_LENGTH 8
 #define MENU_ITEMS       4
+#define CHEAT_VMU_PATH   "/vmu/a1/SMBCHEAT.VMS"
 
 static char saved_cheats[MAX_CHEATS][MAX_CHEAT_LENGTH + 1];
 static int saved_cheat_count;
-static const char cheat_alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+static const char cheat_alphabet[] = "APZLGITYEOXUKSVN";
+static int cheat_save_status = -1;
 static const char *menu_labels[MENU_ITEMS] = {
     "Start Game", "Cheats", "Test", "Quit"
 };
+
+/* VMU package payload is a simple versioned text file; package metadata makes
+   it visible in the Dreamcast BIOS VMU manager. Uses controller 1, VMU slot A. */
+static int save_cheats_to_vmu(void)
+{
+    char payload[512];
+    size_t used = 0;
+    int i, rc;
+    FILE *f;
+    vmu_pkg_t pkg;
+    uint8_t *packed = NULL;
+    int packed_size = 0;
+    static const char magic[] = "SMBCHEATS1\n";
+
+    memcpy(payload, magic, sizeof(magic) - 1);
+    used = sizeof(magic) - 1;
+    for (i = 0; i < saved_cheat_count; ++i) {
+        size_t n = strlen(saved_cheats[i]);
+        if (used + n + 1 >= sizeof(payload)) return 0;
+        memcpy(payload + used, saved_cheats[i], n);
+        used += n;
+        payload[used++] = '\n';
+    }
+
+    memset(&pkg, 0, sizeof(pkg));
+    strncpy(pkg.desc_short, "SMB Cheats", sizeof(pkg.desc_short) - 1);
+    strncpy(pkg.desc_long, "Super Mario Bros Game Genie Codes", sizeof(pkg.desc_long) - 1);
+    strncpy(pkg.app_id, "SMB-DREAMCAST", sizeof(pkg.app_id) - 1);
+    pkg.icon_cnt = 0;
+    pkg.icon_anim_speed = 0;
+    pkg.eyecatch_type = VMUPKG_EC_NONE;
+    pkg.data = (const uint8_t *)payload;
+    pkg.data_len = (int)used;
+
+    rc = vmu_pkg_build(&pkg, &packed, &packed_size);
+    if (rc != 0 || !packed || packed_size <= 0) {
+        free(packed);
+        return 0;
+    }
+    f = fopen(CHEAT_VMU_PATH, "wb");
+    if (!f) {
+        free(packed);
+        return 0;
+    }
+    rc = (fwrite(packed, 1, (size_t)packed_size, f) == (size_t)packed_size);
+    if (fclose(f) != 0) rc = 0;
+    free(packed);
+    return rc;
+}
+
+static void load_cheats_from_vmu(void)
+{
+    FILE *f;
+    long end;
+    uint8_t *packed;
+    vmu_pkg_t pkg;
+    const char *data;
+    size_t pos, data_len;
+    static const char magic[] = "SMBCHEATS1\n";
+
+    saved_cheat_count = 0;
+    nes_game_genie_clear();
+    f = fopen(CHEAT_VMU_PATH, "rb");
+    if (!f) return;
+    if (fseek(f, 0, SEEK_END) != 0 || (end = ftell(f)) <= 0 ||
+        fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return;
+    }
+    packed = (uint8_t *)malloc((size_t)end);
+    if (!packed) { fclose(f); return; }
+    if (fread(packed, 1, (size_t)end, f) != (size_t)end) {
+        free(packed); fclose(f); return;
+    }
+    fclose(f);
+    memset(&pkg, 0, sizeof(pkg));
+    if (vmu_pkg_parse(packed, (size_t)end, &pkg) != 0 ||
+        !pkg.data || pkg.data_len < (int)(sizeof(magic) - 1) ||
+        memcmp(pkg.data, magic, sizeof(magic) - 1) != 0) {
+        free(packed);
+        return;
+    }
+
+    data = (const char *)pkg.data;
+    data_len = (size_t)pkg.data_len;
+    pos = sizeof(magic) - 1;
+    while (pos < data_len && saved_cheat_count < MAX_CHEATS) {
+        char code[MAX_CHEAT_LENGTH + 1];
+        size_t n = 0;
+        while (pos < data_len && data[pos] != '\n' && n < MAX_CHEAT_LENGTH)
+            code[n++] = data[pos++];
+        while (pos < data_len && data[pos] != '\n') pos++;
+        if (pos < data_len && data[pos] == '\n') pos++;
+        code[n] = '\0';
+        if ((n == 6 || n == 8) && nes_game_genie_add(code) == 0) {
+            memcpy(saved_cheats[saved_cheat_count], code, n + 1);
+            saved_cheat_count++;
+        }
+    }
+    free(packed);
+}
 
 /* Code entry is deliberately bounded: codes are kept in RAM for this session. */
 static void add_cheat_code(void)
@@ -728,11 +832,15 @@ static void add_cheat_code(void)
                 else return;
                 dirty = 1; debounce = 7;
             } else if ((pad & PAD_START) && !(prev & PAD_START)) {
-                if (len > 0 && saved_cheat_count < MAX_CHEATS) {
+                if ((len == 6 || len == 8) && saved_cheat_count < MAX_CHEATS &&
+                    nes_game_genie_add(code) == 0) {
                     memcpy(saved_cheats[saved_cheat_count], code, (size_t)len + 1);
                     saved_cheat_count++;
+                    cheat_save_status = save_cheats_to_vmu();
+                    return;
                 }
-                return;
+                dirty = 1;
+                debounce = 7;
             }
         }
         prev = pad;
@@ -747,7 +855,9 @@ static void add_cheat_code(void)
             menu_draw_str(240, line, 1);
             menu_draw_str(300, "D-pad = choose character", 0);
             menu_draw_str(330, "A = add   B = delete/cancel", 0);
-            menu_draw_str(360, "Start = save / Enter", 0);
+            menu_draw_str(360, "Start = save (6 or 8 chars)", 0);
+            if (len != 0 && len != 6 && len != 8)
+                menu_draw_str(400, "Game Genie codes need 6 or 8 chars", 0);
             menu_present();
             dirty = 0;
         } else {
@@ -785,7 +895,10 @@ static void list_cheat_codes(void)
                 menu_draw_str(120 + i * 35, line, 0);
             }
         }
-        menu_draw_str(370, "B = return to main menu", 0);
+        menu_draw_str(350, cheat_save_status == 1 ? "Codes saved on VMU A1" :
+                           (cheat_save_status == 0 ? "VMU save failed (codes RAM-only)" :
+                            "Codes load from VMU A1 when available"), 0);
+        menu_draw_str(385, "B = return", 0);
         menu_present();
     }
 }
@@ -912,6 +1025,8 @@ int main(int argc, char **argv)
         for (i = 0; i < 8; i++) vid_waitvbl();
     }
 
+    /* Load saved Game Genie codes before the menu/game starts. */
+    load_cheats_from_vmu();
     if (!run_main_menu()) return 0;
 
     rom = load_file("/rd/smb.nes", &rom_size);
