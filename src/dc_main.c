@@ -523,59 +523,6 @@ static int test_apu(char *err, size_t errsz)
     return 1;
 }
 
-/* Short original tribute bumper; not a byte-accurate asset rip. */
-static void checkit_bumper(void)
-{
-    int i;
-    snd_stream_hnd_t h = -1;
-
-    menu_init_font();
-    menu_clear();
-    menu_hold(20);
-    menu_clear();
-    menu_draw_str(140, "CN", 0);
-    menu_draw_str(200, "CHECK IT", 0);
-    menu_draw_str(260, "1.0", 0);
-    menu_draw_str(340, "PVR 3D  OK", 0);
-    menu_hold(30);
-
-    if (snd_init() == 0) {
-        if (snd_stream_init() == 0) {
-            h = snd_stream_alloc(test_apu_cb, 4096);
-            if (h >= 0) {
-                static const struct { uint8_t lo; uint8_t hi; int frames; } notes[] = {
-                    { 0xFD, 0x00, 12 }, { 0xC9, 0x00, 12 },
-                    { 0xA9, 0x00, 12 }, { 0x7F, 0x00, 18 },
-                    { 0xA9, 0x00, 10 }, { 0x7F, 0x00, 24 }
-                };
-                snd_stream_start(h, NES_AUDIO_RATE, 0);
-                for (i = 0; i < (int)(sizeof(notes) / sizeof(notes[0])); i++) {
-                    int f;
-                    apu_reset();
-                    apu_write(0x4015, 0x01);
-                    apu_write(0x4000, 0xBF);
-                    apu_write(0x4001, 0x08);
-                    apu_write(0x4002, notes[i].lo);
-                    apu_write(0x4003, notes[i].hi | 0x08);
-                    for (f = 0; f < notes[i].frames; f++) {
-                        snd_stream_poll(h);
-                        vid_waitvbl();
-                    }
-                }
-                snd_stream_stop(h);
-                snd_stream_destroy(h);
-            }
-            snd_stream_shutdown();
-        }
-        snd_shutdown();
-        apu_reset();
-    }
-
-    menu_hold(40);
-    menu_draw_str(400, "Press A / Start", 0);
-    wait_button();
-}
-
 /* Rotating cube through PVR proves the 3D command path is alive. */
 static int test_3d_graphics(char *err, size_t errsz)
 {
@@ -685,9 +632,11 @@ static int test_3d_graphics(char *err, size_t errsz)
         vid_set_mode(dm, PM_RGB565);
         vid_clear(0, 0, 0);
         menu_init_font();
-        menu_hold(4);
+        menu_draw_str(200, "3D test complete", 0);
+        menu_draw_str(240, "Returning to menu in 5 seconds...", 0);
+        menu_present();
+        menu_hold(300);
     }
-    checkit_bumper();
     return 1;
 }
 
@@ -725,12 +674,160 @@ done:
     wait_button();
 }
 
-/* ---- main menu -------------------------------------------------------- */
+/* ---- cheats and main menu --------------------------------------------- */
 
-#define MENU_ITEMS 3
+#define MAX_CHEATS       32
+#define MAX_CHEAT_LENGTH 8
+#define MENU_ITEMS       4
+
+static char saved_cheats[MAX_CHEATS][MAX_CHEAT_LENGTH + 1];
+static int saved_cheat_count;
+static const char cheat_alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 static const char *menu_labels[MENU_ITEMS] = {
-    "Start Game", "Test", "Quit"
+    "Start Game", "Cheats", "Test", "Quit"
 };
+
+/* Code entry is deliberately bounded: codes are kept in RAM for this session. */
+static void add_cheat_code(void)
+{
+    char code[MAX_CHEAT_LENGTH + 1];
+    int len = 0, letter = 0, quit_flag = 0, dirty = 1;
+    uint8_t prev = 0;
+    int debounce = 0;
+    const int alphabet_len = (int)strlen(cheat_alphabet);
+
+    code[0] = '\0';
+    menu_init_font();
+    for (;;) {
+        uint8_t pad = read_pad(&quit_flag);
+        if (quit_flag) return;
+        if (debounce > 0) {
+            debounce--;
+        } else {
+            if ((pad & PAD_UP) && !(prev & PAD_UP)) {
+                letter = (letter + alphabet_len - 1) % alphabet_len;
+                debounce = 7; dirty = 1;
+            } else if ((pad & PAD_DOWN) && !(prev & PAD_DOWN)) {
+                letter = (letter + 1) % alphabet_len;
+                debounce = 7; dirty = 1;
+            } else if ((pad & PAD_LEFT) && !(prev & PAD_LEFT)) {
+                letter = (letter + alphabet_len - 1) % alphabet_len;
+                debounce = 7; dirty = 1;
+            } else if ((pad & PAD_RIGHT) && !(prev & PAD_RIGHT)) {
+                letter = (letter + 1) % alphabet_len;
+                debounce = 7; dirty = 1;
+            }
+            if ((pad & PAD_A) && !(prev & PAD_A)) {
+                if (len < MAX_CHEAT_LENGTH) {
+                    code[len++] = cheat_alphabet[letter];
+                    code[len] = '\0';
+                }
+                dirty = 1; debounce = 7;
+            } else if ((pad & PAD_B) && !(prev & PAD_B)) {
+                if (len > 0) code[--len] = '\0';
+                else return;
+                dirty = 1; debounce = 7;
+            } else if ((pad & PAD_START) && !(prev & PAD_START)) {
+                if (len > 0 && saved_cheat_count < MAX_CHEATS) {
+                    memcpy(saved_cheats[saved_cheat_count], code, (size_t)len + 1);
+                    saved_cheat_count++;
+                }
+                return;
+            }
+        }
+        prev = pad;
+        if (dirty) {
+            char line[64];
+            menu_clear();
+            menu_draw_str(70, "Feeling a little evil, eh?", 0);
+            menu_draw_str(130, "Add Game Genie Code", 0);
+            snprintf(line, sizeof(line), "Code: %-8s", code);
+            menu_draw_str(190, line, 0);
+            snprintf(line, sizeof(line), "Letter: [%c]", cheat_alphabet[letter]);
+            menu_draw_str(240, line, 1);
+            menu_draw_str(300, "D-pad = choose character", 0);
+            menu_draw_str(330, "A = add   B = delete/cancel", 0);
+            menu_draw_str(360, "Start = save / Enter", 0);
+            menu_present();
+            dirty = 0;
+        } else {
+            vid_waitvbl();
+        }
+    }
+}
+
+static void list_cheat_codes(void)
+{
+    int top = 0, i, quit_flag = 0;
+    uint8_t prev = 0;
+    int debounce = 0;
+    for (;;) {
+        uint8_t pad = read_pad(&quit_flag);
+        if (quit_flag || ((pad & PAD_B) && !(prev & PAD_B))) return;
+        if (debounce > 0) debounce--;
+        else if ((pad & PAD_UP) && !(prev & PAD_UP)) {
+            if (top > 0) top--;
+            debounce = 8;
+        } else if ((pad & PAD_DOWN) && !(prev & PAD_DOWN)) {
+            if (top + 6 < saved_cheat_count) top++;
+            debounce = 8;
+        }
+        prev = pad;
+        menu_clear();
+        menu_draw_str(60, "Saved Game Genie Codes", 0);
+        if (saved_cheat_count == 0) {
+            menu_draw_str(150, "No codes saved yet", 0);
+        } else {
+            char line[64];
+            for (i = 0; i < 6 && top + i < saved_cheat_count; i++) {
+                snprintf(line, sizeof(line), "%02d: %s", top + i + 1,
+                         saved_cheats[top + i]);
+                menu_draw_str(120 + i * 35, line, 0);
+            }
+        }
+        menu_draw_str(370, "B = return to main menu", 0);
+        menu_present();
+    }
+}
+
+static void run_cheats_menu(void)
+{
+    int sel = 0, quit_flag = 0, debounce = 0, dirty = 1;
+    uint8_t prev = 0;
+    const char *labels[] = { "Add Cheat Code", "List Cheat Codes", "Back" };
+    menu_init_font();
+    for (;;) {
+        uint8_t pad = read_pad(&quit_flag);
+        if (quit_flag) return;
+        if (debounce > 0) debounce--;
+        else {
+            if ((pad & PAD_UP) && !(prev & PAD_UP)) {
+                sel = (sel + 2) % 3; debounce = 10; dirty = 1;
+            } else if ((pad & PAD_DOWN) && !(prev & PAD_DOWN)) {
+                sel = (sel + 1) % 3; debounce = 10; dirty = 1;
+            } else if ((pad & (PAD_A | PAD_START)) &&
+                       !(prev & (PAD_A | PAD_START))) {
+                if (sel == 0) add_cheat_code();
+                else if (sel == 1) list_cheat_codes();
+                else return;
+                prev = 0; debounce = 10; dirty = 1;
+            } else if ((pad & PAD_B) && !(prev & PAD_B)) {
+                return;
+            }
+        }
+        prev = pad;
+        if (dirty) {
+            menu_clear();
+            menu_draw_str(90, "Feeling a little evil, eh?", 0);
+            menu_draw_str(170, labels[0], sel == 0);
+            menu_draw_str(220, labels[1], sel == 1);
+            menu_draw_str(270, labels[2], sel == 2);
+            menu_draw_str(350, "A / Start = Select   B = Back", 0);
+            menu_present();
+            dirty = 0;
+        } else vid_waitvbl();
+    }
+}
 
 static int run_main_menu(void)
 {
@@ -750,21 +847,19 @@ static int run_main_menu(void)
         } else {
             if ((pad & PAD_UP) && !(prev & PAD_UP)) {
                 sel = (sel + MENU_ITEMS - 1) % MENU_ITEMS;
-                debounce = 12;
-                dirty = 1;
+                debounce = 12; dirty = 1;
             }
             if ((pad & PAD_DOWN) && !(prev & PAD_DOWN)) {
                 sel = (sel + 1) % MENU_ITEMS;
-                debounce = 12;
-                dirty = 1;
+                debounce = 12; dirty = 1;
             }
             if ((pad & (PAD_A | PAD_START)) && !(prev & (PAD_A | PAD_START))) {
                 if (sel == 0) return 1;
-                if (sel == 2) return 0;
-                if (confirm_yes_no("Are you sure you wanna test?",
-                                   "It might look or sound creepy.")) {
+                if (sel == 1) run_cheats_menu();
+                if (sel == 3) return 0;
+                if (sel == 2 && confirm_yes_no("Are you sure you wanna test?",
+                                               "It might look or sound creepy."))
                     run_diagnostics();
-                }
                 prev = 0;
                 debounce = 12;
                 dirty = 1;
@@ -775,11 +870,12 @@ static int run_main_menu(void)
         if (dirty) {
             vid_waitvbl();
             menu_clear();
-            menu_draw_str(120, "Welcome to SMB for Dreamcast", 0);
-            menu_draw_str(160, "A / Start = Select", 0);
-            menu_draw_str(240, menu_labels[0], sel == 0);
-            menu_draw_str(280, menu_labels[1], sel == 1);
-            menu_draw_str(320, menu_labels[2], sel == 2);
+            menu_draw_str(100, "Welcome to SMB for Dreamcast", 0);
+            menu_draw_str(140, "A / Start = Select", 0);
+            menu_draw_str(210, menu_labels[0], sel == 0);
+            menu_draw_str(250, menu_labels[1], sel == 1);
+            menu_draw_str(290, menu_labels[2], sel == 2);
+            menu_draw_str(330, menu_labels[3], sel == 3);
             menu_present();
             dirty = 0;
         } else {
