@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #include <kos/init.h>
+#include <kos/thread.h>
 #include <dc/video.h>
 #include <dc/pvr.h>
 #include <dc/maple.h>
@@ -23,6 +24,9 @@
 #include <dc/sound/sound.h>
 #include <dc/sound/stream.h>
 #include <dc/biosfont.h>
+#include <dc/flashrom.h>
+#include <dc/syscalls.h>
+#include <dc/wdt.h>
 
 #include "nes.h"
 
@@ -38,6 +42,8 @@ KOS_INIT_FLAGS(INIT_DEFAULT);
 
 static uint16_t fb[256 * 256] __attribute__((aligned(32)));      /* PPU output, rows 0..239 used */
 static int16_t  abuf[AUDIO_BUF_BYTES / 2] __attribute__((aligned(32)));
+
+static void menu_init_font(void);   /* defined with menu helpers below */
 
 /* KOS passes/expects BYTES here, even though the parameters are named smp_*. */
 static void *audio_cb(snd_stream_hnd_t hnd, int req_bytes, int *got_bytes)
@@ -67,8 +73,10 @@ static uint8_t *load_file(const char *path, size_t *size)
 static void fatal(const char *msg)
 {
     int i;
-    bfont_set_encoding(BFONT_CODE_ISO8859_1);
-    bfont_draw_str(vram_s + 24 * 640 + 24, 640, true, msg);
+    int pitch = (vid_mode && vid_mode->width) ? (int)vid_mode->width : 640;
+    menu_init_font();
+    vid_clear(0, 0, 0);
+    bfont_draw_str(vram_s + 24 * pitch + 24, pitch, true, msg);
     for (i = 0; i < 60 * 8; i++) vid_waitvbl();
 }
 
@@ -109,25 +117,44 @@ static void set_vertex(pvr_vertex_t *v, float x, float y, float u, float t, uint
 
 /* ---- menu helpers ----------------------------------------------------- */
 
+/* Pitch in pixels for the current framebuffer row */
+static int menu_pitch(void)
+{
+    return (vid_mode && vid_mode->width) ? (int)vid_mode->width : 640;
+}
+
+/* Reset bfont to clean 16-bit white-on-black (BIOS may leave garbage colors) */
+static void menu_init_font(void)
+{
+    bfont_set_encoding(BFONT_CODE_ISO8859_1);
+    bfont_set_32bit_mode(0);
+    /* RGB565: white foreground, black background */
+    bfont_set_foreground_color(0xFFFF);
+    bfont_set_background_color(0x0000);
+}
+
 static void menu_clear(void)
 {
-    memset(vram_s, 0, 640 * 480 * 2);
+    /* Prefer KOS clear (handles current FB / store queues) over fixed memset */
+    vid_clear(0, 0, 0);
 }
 
 static void menu_draw_str(int y, const char *str, int highlight)
 {
+    int pitch = menu_pitch();
     int len = (int)strlen(str);
-    int x = (640 - len * 12) / 2;
+    int x = (pitch - len * 12) / 2;
     if (x < 8) x = 8;
 
     if (highlight)
-        bfont_draw_str(vram_s + y * 640 + (x - 16), 640, true, ">");
-    bfont_draw_str(vram_s + y * 640 + x, 640, true, str);
+        bfont_draw_str(vram_s + y * pitch + (x - 16), pitch, true, ">");
+    bfont_draw_str(vram_s + y * pitch + x, pitch, true, str);
 }
 
 static void menu_draw_str_left(int y, int x, const char *str)
 {
-    bfont_draw_str(vram_s + y * 640 + x, 640, true, str);
+    int pitch = menu_pitch();
+    bfont_draw_str(vram_s + y * pitch + x, pitch, true, str);
 }
 
 /* Wait until A/Start is released then pressed again (or quit combo). */
@@ -158,7 +185,7 @@ static int confirm_yes_no(const char *line1, const char *line2)
     int debounce = 0;
     int armed = 0; /* ignore buttons still held from the previous screen */
 
-    bfont_set_encoding(BFONT_CODE_ISO8859_1);
+    menu_init_font();
 
     while (1) {
         uint8_t pad = read_pad(&quit_flag);
@@ -212,39 +239,40 @@ static int confirm_yes_no(const char *line1, const char *line2)
 
 static int test_graphics(char *err, size_t errsz)
 {
-    int x, y;
+    int x, y, pitch = menu_pitch();
     uint16_t *v = vram_s;
     uint16_t colors[8] = {
         RGB565(255, 0, 0), RGB565(0, 255, 0), RGB565(0, 0, 255), RGB565(255, 255, 0),
         RGB565(255, 0, 255), RGB565(0, 255, 255), RGB565(255, 255, 255), RGB565(0, 0, 0)
     };
 
+    menu_init_font();
     menu_clear();
     menu_draw_str(40, "Testing graphics...", 0);
     vid_waitvbl();
 
     /* Color bars */
     for (y = 80; y < 200; y++) {
-        for (x = 0; x < 640; x++) {
-            v[y * 640 + x] = colors[(x * 8) / 640];
+        for (x = 0; x < pitch; x++) {
+            v[y * pitch + x] = colors[(x * 8) / pitch];
         }
     }
     for (y = 0; y < 30; y++) vid_waitvbl();
 
     /* Checkerboard */
     for (y = 210; y < 340; y++) {
-        for (x = 0; x < 640; x++) {
+        for (x = 0; x < pitch; x++) {
             int c = ((x / 16) ^ (y / 16)) & 1;
-            v[y * 640 + x] = c ? RGB565(200, 200, 200) : RGB565(40, 40, 40);
+            v[y * pitch + x] = c ? RGB565(200, 200, 200) : RGB565(40, 40, 40);
         }
     }
     for (y = 0; y < 30; y++) vid_waitvbl();
 
     /* Write/read-back check on a few pixels */
-    v[100 * 640 + 100] = RGB565(123, 45, 67);
-    v[200 * 640 + 300] = RGB565(10, 20, 30);
-    if (v[100 * 640 + 100] != RGB565(123, 45, 67) ||
-        v[200 * 640 + 300] != RGB565(10, 20, 30)) {
+    v[100 * pitch + 100] = RGB565(123, 45, 67);
+    v[200 * pitch + 300] = RGB565(10, 20, 30);
+    if (v[100 * pitch + 100] != RGB565(123, 45, 67) ||
+        v[200 * pitch + 300] != RGB565(10, 20, 30)) {
         snprintf(err, errsz, "Graphics: framebuffer read-back failed");
         return 0;
     }
@@ -255,38 +283,125 @@ static int test_graphics(char *err, size_t errsz)
     return 1;
 }
 
-static int test_sound_system(char *err, size_t errsz)
+/*
+ * BIOS assets + hardware authenticity test.
+ *
+ * Real Dreamcast BIOS exposes ROM font + flashrom via syscalls.
+ * Emulators often load a BIOS image but still fail WDT (almost never emulated).
+ * There is no KOS API to replay the official boot jingle from the BIOS ROM;
+ * instead we prove BIOS/ROM access and real SH4 hardware.
+ *
+ * Returns 0 and sets err if we conclude this is likely an emulator / no BIOS.
+ */
+static volatile int wdt_fired;
+
+static void wdt_test_cb(void *user)
 {
-    int i;
+    (void)user;
+    wdt_fired = 1;
+}
+
+static int test_bios_assets(char *err, size_t errsz)
+{
+    int i, region;
+    uint8_t *font;
+    uint8_t probe[16];
+    flashrom_syscfg_t syscfg;
     uint32_t mem;
 
     menu_clear();
-    menu_draw_str(40, "Testing sound system...", 0);
-    menu_draw_str(80, "(BIOS / AICA init)", 0);
+    menu_draw_str(40, "Testing BIOS assets...", 0);
+    menu_draw_str(80, "(ROM font / flashrom / WDT)", 0);
     vid_waitvbl();
 
+    /* ---- 1) BIOS ROM font (actual BIOS asset) ---- */
+    if (syscall_font_lock() != 0) {
+        snprintf(err, errsz, "Emulator?: BIOS font lock failed");
+        return 0;
+    }
+    font = syscall_font_address();
+    if (!font) {
+        syscall_font_unlock();
+        snprintf(err, errsz, "Emulator?: no BIOS ROM font");
+        return 0;
+    }
+    /* Touch a few bytes so the read is real (not a fake non-NULL) */
+    for (i = 0; i < 16; i++)
+        probe[i] = font[i];
+    syscall_font_unlock();
+
+    /* Must not be all 0x00 or all 0xFF (typical empty/missing dump) */
+    {
+        int all0 = 1, allf = 1;
+        for (i = 0; i < 16; i++) {
+            if (probe[i] != 0x00) all0 = 0;
+            if (probe[i] != 0xFF) allf = 0;
+        }
+        if (all0 || allf) {
+            snprintf(err, errsz, "Emulator?: BIOS font data empty");
+            return 0;
+        }
+    }
+
+    /* Show that we can draw with the BIOS font (visible asset) */
+    menu_clear();
+    menu_draw_str(100, "BIOS ROM font OK", 0);
+    menu_draw_str(140, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 0);
+    menu_draw_str(180, "0123456789 !@#$%", 0);
+    for (i = 0; i < 45; i++) vid_waitvbl();
+
+    /* ---- 2) Flashrom system config (BIOS settings store) ---- */
+    region = flashrom_get_region();
+    if (region < 0) {
+        snprintf(err, errsz, "Emulator?: flashrom region failed");
+        return 0;
+    }
+    if (flashrom_get_syscfg(&syscfg) < 0) {
+        snprintf(err, errsz, "Emulator?: flashrom syscfg failed");
+        return 0;
+    }
+
+    menu_clear();
+    menu_draw_str(100, "Flashrom / BIOS config OK", 0);
+    {
+        char line[64];
+        snprintf(line, sizeof(line), "Region code: %d", region);
+        menu_draw_str(140, line, 0);
+    }
+    for (i = 0; i < 40; i++) vid_waitvbl();
+
+    /* ---- 3) AICA still required for "sound path alive" ---- */
     if (snd_init() != 0) {
         snprintf(err, errsz, "Sound: snd_init() failed");
         return 0;
     }
-
     mem = snd_mem_available();
     if (mem == 0) {
         snd_shutdown();
-        snprintf(err, errsz, "Sound: no AICA RAM available");
+        snprintf(err, errsz, "Sound: no AICA RAM (emu?)");
         return 0;
     }
-
     if (snd_stream_init() != 0) {
         snd_shutdown();
-        snprintf(err, errsz, "Sound: snd_stream_init() failed");
+        snprintf(err, errsz, "Sound: stream init failed");
         return 0;
     }
     snd_stream_shutdown();
     snd_shutdown();
 
+    /* ---- 4) SH4 Watchdog Timer — almost never emulated ---- */
+    wdt_fired = 0;
+    wdt_enable_timer(0, 1000, 15, wdt_test_cb, NULL); /* \~1 ms period */
+    thd_sleep(5);   /* wait well past one period */
+    wdt_disable();
+
+    if (!wdt_fired) {
+        snprintf(err, errsz, "Emulator detected (WDT IRQ missing)");
+        return 0;
+    }
+
     menu_clear();
-    menu_draw_str(200, "Sound system OK", 0);
+    menu_draw_str(200, "BIOS + hardware OK", 0);
     for (i = 0; i < 40; i++) vid_waitvbl();
     return 1;
 }
@@ -401,7 +516,7 @@ static void run_diagnostics(void)
         fail_msg = err;
         goto done;
     }
-    if (!test_sound_system(err, sizeof(err))) {
+    if (!test_bios_assets(err, sizeof(err))) {
         ok = 0;
         fail_msg = err;
         goto done;
@@ -417,10 +532,13 @@ done:
     if (ok) {
         menu_draw_str(200, "All done, it's fine.", 0);
     } else {
-        menu_draw_str(160, "Abnormality detected:", 0);
-        menu_draw_str(200, fail_msg ? fail_msg : "Unknown error", 0);
+        menu_draw_str(140, "Abnormality detected:", 0);
+        menu_draw_str(180, fail_msg ? fail_msg : "Unknown error", 0);
+        /* Hint when BIOS/WDT path failed */
+        if (fail_msg && (strstr(fail_msg, "Emulator") || strstr(fail_msg, "BIOS")))
+            menu_draw_str(240, "Assuming emulator / no real BIOS", 0);
     }
-    menu_draw_str(300, "Press A / Start to continue", 0);
+    menu_draw_str(320, "Press A / Start to continue", 0);
     wait_button();
 }
 
@@ -445,7 +563,7 @@ static int run_main_menu(void)
     uint8_t prev = 0;
     int debounce = 0;
 
-    bfont_set_encoding(BFONT_CODE_ISO8859_1);
+    menu_init_font();
 
     while (1) {
         uint8_t pad = read_pad(&quit_flag);
@@ -503,8 +621,20 @@ int main(int argc, char **argv)
     int quit = 0;
     (void)argc; (void)argv;
 
-    /* 60 Hz output on every cable (PAL consoles use NTSC-60 interlaced on composite/RGB). */
-    vid_set_mode(vid_check_cable() == CT_VGA ? DM_640x480_VGA : DM_640x480_NTSC_IL, PM_RGB565);
+    /* 60 Hz output on every cable (PAL consoles use NTSC-60 interlaced on composite/RGB).
+     * When launched from the official BIOS CD menu, VRAM and bfont state are dirty —
+     * fully re-init video, wipe VRAM, then force clean 16-bit font colors. */
+    {
+        int i;
+        int dm = (vid_check_cable() == CT_VGA) ? DM_640x480_VGA : DM_640x480_NTSC_IL;
+        vid_set_mode(dm, PM_RGB565);
+        vid_empty();                 /* wipe all of VRAM (BIOS leftovers) */
+        vid_set_mode(dm, PM_RGB565); /* re-apply mode after empty */
+        vid_clear(0, 0, 0);
+        menu_init_font();
+        for (i = 0; i < 4; i++)
+            vid_waitvbl();
+    }
 
     /* ---- Main menu (before ROM / PVR / audio) ---- */
     if (!run_main_menu()) {
@@ -564,3 +694,4 @@ int main(int argc, char **argv)
     free(rom);
     return 0;
 }
+/* I'M TIRED OF THIS GRANDPA! WELL THAT'S TOO DAMN BAD!!*/
