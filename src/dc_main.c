@@ -684,7 +684,7 @@ done:
 
 static char saved_cheats[MAX_CHEATS][MAX_CHEAT_LENGTH + 1];
 static int saved_cheat_count;
-static const char cheat_alphabet[] = "APZLGITYEOXUKSVN";
+static const char cheat_alphabet[] = "AEGIKLNOPSTUVXYZ";
 static int cheat_save_status = -1;
 static const char *menu_labels[MENU_ITEMS] = {
     "Start Game", "Cheats", "Test", "Quit"
