@@ -15,6 +15,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <fcntl.h>
 
 #include <kos/init.h>
 #include <kos/thread.h>
@@ -29,6 +30,7 @@
 #include <dc/syscalls.h>
 #include <dc/wdt.h>
 #include <dc/vmu_pkg.h>
+#include <dc/fs_vmu.h>
 
 #include "nes.h"
 
@@ -684,30 +686,30 @@ done:
 
 static char saved_cheats[MAX_CHEATS][MAX_CHEAT_LENGTH + 1];
 static int saved_cheat_count;
+/* Alphabetical order of the 16 valid Game Genie characters. */
 static const char cheat_alphabet[] = "AEGIKLNOPSTUVXYZ";
 static int cheat_save_status = -1;
 static const char *menu_labels[MENU_ITEMS] = {
     "Start Game", "Cheats", "Test", "Quit"
 };
 
-/* VMU package payload is a simple versioned text file; package metadata makes
-   it visible in the Dreamcast BIOS VMU manager. Uses controller 1, VMU slot A. */
+/* Save the cheat list as the VMU filesystem payload and attach its BIOS header.
+   /vmu/a1 is VMU 1 in controller port A. */
 static int save_cheats_to_vmu(void)
 {
     char payload[512];
-    size_t used = 0;
-    int i, rc;
+    size_t used = 0, write_size;
+    int i, ok = 1;
     FILE *f;
+    file_t fd;
     vmu_pkg_t pkg;
-    uint8_t *packed = NULL;
-    int packed_size = 0;
     static const char magic[] = "SMBCHEATS1\n";
 
     memcpy(payload, magic, sizeof(magic) - 1);
     used = sizeof(magic) - 1;
     for (i = 0; i < saved_cheat_count; ++i) {
         size_t n = strlen(saved_cheats[i]);
-        if (used + n + 1 >= sizeof(payload)) return 0;
+        if (used + n + 1 > sizeof(payload)) return 0;
         memcpy(payload + used, saved_cheats[i], n);
         used += n;
         payload[used++] = '\n';
@@ -715,7 +717,8 @@ static int save_cheats_to_vmu(void)
 
     memset(&pkg, 0, sizeof(pkg));
     strncpy(pkg.desc_short, "SMB Cheats", sizeof(pkg.desc_short) - 1);
-    strncpy(pkg.desc_long, "Super Mario Bros Game Genie Codes", sizeof(pkg.desc_long) - 1);
+    strncpy(pkg.desc_long, "Super Mario Bros Game Genie Codes",
+            sizeof(pkg.desc_long) - 1);
     strncpy(pkg.app_id, "SMB-DREAMCAST", sizeof(pkg.app_id) - 1);
     pkg.icon_cnt = 0;
     pkg.icon_anim_speed = 0;
@@ -723,27 +726,30 @@ static int save_cheats_to_vmu(void)
     pkg.data = (const uint8_t *)payload;
     pkg.data_len = (int)used;
 
-    rc = vmu_pkg_build(&pkg, &packed, &packed_size);
-    if (rc != 0 || !packed || packed_size <= 0) {
-        free(packed);
-        return 0;
-    }
+    /* VMU files occupy 512-byte blocks; the header records the true length. */
+    write_size = (used + 511U) & ~(size_t)511U;
+    memset(payload + used, 0, write_size - used);
+
+    /* The /vmu filesystem stores the payload, not a second packed package. */
     f = fopen(CHEAT_VMU_PATH, "wb");
-    if (!f) {
-        free(packed);
-        return 0;
-    }
-    rc = (fwrite(packed, 1, (size_t)packed_size, f) == (size_t)packed_size);
-    if (fclose(f) != 0) rc = 0;
-    free(packed);
-    return rc;
+    if (!f) return 0;
+    if (fwrite(payload, 1, write_size, f) != write_size) ok = 0;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) return 0;
+
+    /* Store the package metadata separately so the BIOS recognizes the file. */
+    fd = fs_open(CHEAT_VMU_PATH, O_WRONLY);
+    if (fd < 0) return 0;
+    if (fs_vmu_set_header(fd, &pkg) < 0) ok = 0;
+    fs_close(fd);
+    return ok;
 }
 
 static void load_cheats_from_vmu(void)
 {
     FILE *f;
     long end;
-    uint8_t *packed;
+    uint8_t *raw;
     vmu_pkg_t pkg;
     const char *data;
     size_t pos, data_len;
@@ -758,37 +764,46 @@ static void load_cheats_from_vmu(void)
         fclose(f);
         return;
     }
-    packed = (uint8_t *)malloc((size_t)end);
-    if (!packed) { fclose(f); return; }
-    if (fread(packed, 1, (size_t)end, f) != (size_t)end) {
-        free(packed); fclose(f); return;
+    raw = (uint8_t *)malloc((size_t)end);
+    if (!raw) { fclose(f); return; }
+    if (fread(raw, 1, (size_t)end, f) != (size_t)end) {
+        free(raw); fclose(f); return;
     }
     fclose(f);
-    memset(&pkg, 0, sizeof(pkg));
-    if (vmu_pkg_parse(packed, (size_t)end, &pkg) != 0 ||
-        !pkg.data || pkg.data_len < (int)(sizeof(magic) - 1) ||
-        memcmp(pkg.data, magic, sizeof(magic) - 1) != 0) {
-        free(packed);
-        return;
+
+    /* New saves are raw text payloads. Accept old packed-package saves too. */
+    data = (const char *)raw;
+    data_len = (size_t)end;
+    if (data_len < sizeof(magic) - 1 ||
+        memcmp(data, magic, sizeof(magic) - 1) != 0) {
+        memset(&pkg, 0, sizeof(pkg));
+        if (vmu_pkg_parse(raw, (size_t)end, &pkg) != 0 || !pkg.data ||
+            pkg.data_len < (int)(sizeof(magic) - 1) ||
+            memcmp(pkg.data, magic, sizeof(magic) - 1) != 0) {
+            free(raw);
+            return;
+        }
+        data = (const char *)pkg.data;
+        data_len = (size_t)pkg.data_len;
     }
 
-    data = (const char *)pkg.data;
-    data_len = (size_t)pkg.data_len;
     pos = sizeof(magic) - 1;
     while (pos < data_len && saved_cheat_count < MAX_CHEATS) {
         char code[MAX_CHEAT_LENGTH + 1];
         size_t n = 0;
-        while (pos < data_len && data[pos] != '\n' && n < MAX_CHEAT_LENGTH)
+        while (pos < data_len && data[pos] != '\n' && data[pos] != '\0' &&
+               n < MAX_CHEAT_LENGTH)
             code[n++] = data[pos++];
-        while (pos < data_len && data[pos] != '\n') pos++;
+        while (pos < data_len && data[pos] != '\n' && data[pos] != '\0') pos++;
         if (pos < data_len && data[pos] == '\n') pos++;
+        if (pos < data_len && data[pos] == '\0') break;
         code[n] = '\0';
         if ((n == 6 || n == 8) && nes_game_genie_add(code) == 0) {
             memcpy(saved_cheats[saved_cheat_count], code, n + 1);
             saved_cheat_count++;
         }
     }
-    free(packed);
+    free(raw);
 }
 
 /* Code entry is deliberately bounded: codes are kept in RAM for this session. */
@@ -1116,3 +1131,4 @@ int main(int argc, char **argv)
 }
 
 /* I'M TIRED OF THIS GRANDPA! WELL THAT'S TOO DAMN BAD!!*/
+
