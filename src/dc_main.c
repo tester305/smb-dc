@@ -156,12 +156,28 @@ static int confirm_yes_no(const char *line1, const char *line2)
     int quit_flag = 0;
     uint8_t prev = 0;
     int debounce = 0;
+    int armed = 0; /* ignore buttons still held from the previous screen */
 
     bfont_set_encoding(BFONT_CODE_ISO8859_1);
 
     while (1) {
         uint8_t pad = read_pad(&quit_flag);
         if (quit_flag) return 0;
+
+        /* Wait until A/Start/B are released before accepting input */
+        if (!armed) {
+            if (!(pad & (PAD_A | PAD_START | PAD_B)))
+                armed = 1;
+            prev = pad;
+            menu_clear();
+            if (line1) menu_draw_str(140, line1, 0);
+            if (line2) menu_draw_str(170, line2, 0);
+            menu_draw_str(240, "Yes", sel == 1);
+            menu_draw_str(280, "No",  sel == 0);
+            menu_draw_str(340, "A/Start = OK   B = Cancel", 0);
+            vid_waitvbl();
+            continue;
+        }
 
         if (debounce > 0) {
             debounce--;
@@ -233,7 +249,6 @@ static int test_graphics(char *err, size_t errsz)
         return 0;
     }
 
-    /* bfont still works after fills */
     menu_clear();
     menu_draw_str(200, "Graphics OK", 0);
     for (y = 0; y < 40; y++) vid_waitvbl();
@@ -262,7 +277,6 @@ static int test_sound_system(char *err, size_t errsz)
         return 0;
     }
 
-    /* Exercise stream layer briefly (alloc + destroy) */
     if (snd_stream_init() != 0) {
         snd_shutdown();
         snprintf(err, errsz, "Sound: snd_stream_init() failed");
@@ -312,7 +326,7 @@ static int test_apu(char *err, size_t errsz)
     apu_write(0x4000, 0xBF);          /* duty 2, const vol, vol=15 */
     apu_write(0x4001, 0x08);          /* sweep off */
     apu_write(0x4002, 0xFD);          /* timer low  (approx A4) */
-    apu_write(0x4003, 0x00);          /* timer high + length */
+    apu_write(0x4003, 0x08);          /* timer high + length (len_tab[1]=254) */
 
     apu_generate(samples, 2048);
 
@@ -351,10 +365,10 @@ static int test_apu(char *err, size_t errsz)
             }
             /* Switch to noise for a moment */
             apu_reset();
-            apu_write(0x4015, 0x08);
-            apu_write(0x400C, 0x3F);
-            apu_write(0x400E, 0x04);
-            apu_write(0x400F, 0x08);
+            apu_write(0x4015, 0x08);  /* enable noise */
+            apu_write(0x400C, 0x3F);  /* const vol, vol=15 */
+            apu_write(0x400E, 0x04);  /* period */
+            apu_write(0x400F, 0x18);  /* length index 3 → longer note */
             for (i = 0; i < 30; i++) {
                 snd_stream_poll(h);
                 vid_waitvbl();
