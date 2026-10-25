@@ -46,10 +46,97 @@ static const uint8_t cyc_tab[256] = {
     /* 0xF0 */ 2,5,0,0,4,4,6,0,2,4,2,0,4,4,7,0
 };
 
+#define NES_MAX_GAME_GENIE 32
+
+typedef struct {
+    uint16_t address;
+    uint8_t value;
+    uint8_t compare;
+    uint8_t has_compare;
+} game_genie_t;
+
+static game_genie_t game_genie[NES_MAX_GAME_GENIE];
+static int game_genie_count;
+static const char game_genie_alphabet[] = "APZLGITYEOXUKSVN";
+
+void nes_game_genie_clear(void)
+{
+    game_genie_count = 0;
+    memset(game_genie, 0, sizeof game_genie);
+}
+
+int nes_game_genie_count(void)
+{
+    return game_genie_count;
+}
+
+static int game_genie_nibble(char ch)
+{
+    const char *p = strchr(game_genie_alphabet, ch);
+    return p ? (int)(p - game_genie_alphabet) : -1;
+}
+
+int nes_game_genie_add(const char *code)
+{
+    uint8_t n[8];
+    size_t len, i;
+    uint16_t address;
+    uint8_t value, compare = 0;
+    int has_compare;
+
+    if (!code) return -1;
+    len = strlen(code);
+    if (len != 6 && len != 8) return -1;
+    if (game_genie_count >= NES_MAX_GAME_GENIE) return -1;
+    for (i = 0; i < len; ++i) {
+        int v = game_genie_nibble(code[i]);
+        if (v < 0) return -1;
+        n[i] = (uint8_t)v;
+    }
+
+    address = (uint16_t)(0x8000 |
+        ((n[3] & 7) << 12) |
+        ((n[5] & 7) << 8)  |
+        ((n[4] & 8) << 8)  |
+        ((n[2] & 7) << 4)  |
+        ((n[1] & 8) << 4)  |
+        (n[4] & 7)         |
+        (n[3] & 8));
+    if (len == 6) {
+        value = (uint8_t)(((n[1] & 7) << 4) | ((n[0] & 8) << 4) |
+                          (n[0] & 7) | (n[5] & 8));
+        has_compare = 0;
+    } else {
+        value = (uint8_t)(((n[1] & 7) << 4) | ((n[0] & 8) << 4) |
+                          (n[0] & 7) | (n[7] & 8));
+        compare = (uint8_t)(((n[7] & 7) << 4) | ((n[6] & 8) << 4) |
+                            (n[6] & 7) | (n[5] & 8));
+        /* The original Game Genie treats a zero compare byte as disabled. */
+        has_compare = (compare != 0);
+    }
+
+    game_genie[game_genie_count].address = address;
+    game_genie[game_genie_count].value = value;
+    game_genie[game_genie_count].compare = compare;
+    game_genie[game_genie_count].has_compare = (uint8_t)has_compare;
+    game_genie_count++;
+    return 0;
+}
+
 static inline uint8_t rd(uint16_t a)
 {
     if (a < 0x2000) return nes_ram[a & 0x07FF];
-    if (a >= 0x8000) return nes_prg[a & nes_prg_mask];
+    if (a >= 0x8000) {
+        uint8_t original = nes_prg[a & nes_prg_mask];
+        int i;
+        for (i = 0; i < game_genie_count; ++i) {
+            const game_genie_t *g = &game_genie[i];
+            if (g->address == a &&
+                (!g->has_compare || original == g->compare))
+                return g->value;
+        }
+        return original;
+    }
     return nes_io_read(a);
 }
 
