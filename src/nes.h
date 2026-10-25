@@ -1,6 +1,6 @@
 /*
  * Minimal NES core (mapper 0 / NROM) used to run the Super Mario Bros.
- * disassembly build on the Sega Dreamcast. Portable C, no platform code.
+ * disassembly build on the Sega Dreamcast.
  */
 #ifndef NES_CORE_H
 #define NES_CORE_H
@@ -23,51 +23,44 @@ enum {
     PAD_RIGHT  = 0x80
 };
 
-/* ---- Public API ------------------------------------------------------- */
-
-/* Image must stay valid for as long as the core runs. Returns 0 on success. */
+/* Public API */
 int nes_load(const uint8_t *image, size_t size);
-
 void nes_reset(void);
+void nes_power_on(void);
 void nes_set_pad(uint8_t pad);
 
-/* Runs one frame. fb = 256 pixels per row, 240 rows, RGB565. */
+/* Runs one frame. Framebuffer is 256x240 RGB565. */
 void nes_run_frame(uint16_t *fb);
 
-/* Renders mono 16-bit samples at NES_AUDIO_RATE from the current APU state. */
+/* Generate mono 16-bit audio samples. */
 void nes_audio_render(int16_t *dst, int n);
 
 uint8_t nes_peek_ram(uint16_t addr);
 
-/* ---- NES Game Genie --------------------------------------------------- */
-
 /*
- * Supports standard 6-character and 8-character NES Game Genie codes.
- * nes_game_genie_add returns the cheat index on success:
- *   >= 0: successfully added
- *   -1: invalid code
- *   -2: cheat list full
+ * Game Genie:
+ * 6-character codes replace a ROM byte.
+ * 8-character codes replace a ROM byte when the compare matches.
+ *
+ * nes_game_genie_add returns 0 on success, -1 on invalid code
+ * or when the cheat list is full.
  */
 void nes_game_genie_clear(void);
 int nes_game_genie_add(const char *code);
 int nes_game_genie_count(void);
 
-/*
- * Apply a cheat to a PRG-ROM read.
- * Must be called by the CPU's PRG-ROM read path.
- */
-uint8_t nes_game_genie_apply(uint16_t address, uint8_t original);
+/* Internal shared state */
+extern uint8_t nes_ram[0x800];
 
-/* ---- Internal API (shared between core source files) ------------------ */
-
-extern uint8_t        nes_ram[0x800];
 extern const uint8_t *nes_prg;
-extern uint16_t       nes_prg_mask;
+extern uint16_t nes_prg_mask;
+
 extern const uint8_t *nes_chr;
-extern int            nes_chr_is_ram;
-extern uint8_t        nes_chr_ram[0x2000];
-extern int            nes_mirror_vertical;
-extern int            nes_nmi_pending;
+extern int nes_chr_is_ram;
+extern uint8_t nes_chr_ram[0x2000];
+
+extern int nes_mirror_vertical;
+extern int nes_nmi_pending;
 
 /* CPU */
 void cpu_reset(void);
@@ -97,4 +90,4 @@ void apu_write(uint16_t addr, uint8_t data);
 uint8_t apu_read_status(void);
 void apu_generate(int16_t *out, int n);
 
-#endif /* NES_CORE_H */
+#endif
