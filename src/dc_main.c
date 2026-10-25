@@ -29,7 +29,7 @@
 KOS_INIT_FLAGS(INIT_DEFAULT);
 
 #define TXR_BYTES        (256 * 256 * 2)
-#define AUDIO_BUF_BYTES  16384            /* AICA stream buffer: ~185 ms at 44.1 kHz mono */
+#define AUDIO_BUF_BYTES  16384            /* AICA stream buffer: \~185 ms at 44.1 kHz mono */
 #define STICK_DEADZONE   40
 
 /* 1 = sharp pixel-perfect 2x (512x480, black bars left/right, nearest filter)
@@ -107,6 +107,87 @@ static void set_vertex(pvr_vertex_t *v, float x, float y, float u, float t, uint
     v->oargb = 0;
 }
 
+/* ---- simple main menu ------------------------------------------------- */
+
+#define MENU_ITEMS 2
+static const char *menu_labels[MENU_ITEMS] = {
+    "Start Game",
+    "Quit"
+};
+
+/* Clear the 640x480 RGB565 framebuffer to black */
+static void menu_clear(void)
+{
+    memset(vram_s, 0, 640 * 480 * 2);
+}
+
+/* Draw a centered-ish string on a given scanline */
+static void menu_draw_str(int y, const char *str, int highlight)
+{
+    /* bfont is \~12 px wide per character; centre roughly for 640 width */
+    int len = (int)strlen(str);
+    int x = (640 - len * 12) / 2;
+    if (x < 8) x = 8;
+
+    if (highlight) {
+        /* simple prefix cursor */
+        bfont_draw_str(vram_s + y * 640 + (x - 16), 640, true, ">");
+    }
+    bfont_draw_str(vram_s + y * 640 + x, 640, true, str);
+}
+
+/*
+ * Blocks until the player chooses an item.
+ * Returns 1 = Start Game, 0 = Quit.
+ */
+static int run_main_menu(void)
+{
+    int sel = 0;
+    int quit_flag = 0;
+    uint8_t prev = 0;
+    int debounce = 0;
+
+    bfont_set_encoding(BFONT_CODE_ISO8859_1);
+
+    while (1) {
+        uint8_t pad = read_pad(&quit_flag);
+        if (quit_flag)
+            return 0;   /* force quit via button combo */
+
+        /* rising-edge detection with a short debounce */
+        if (debounce > 0) {
+            debounce--;
+        } else {
+            if ((pad & PAD_UP) && !(prev & PAD_UP)) {
+                sel = (sel + MENU_ITEMS - 1) % MENU_ITEMS;
+                debounce = 12;
+            }
+            if ((pad & PAD_DOWN) && !(prev & PAD_DOWN)) {
+                sel = (sel + 1) % MENU_ITEMS;
+                debounce = 12;
+            }
+            if ((pad & (PAD_A | PAD_START)) && !(prev & (PAD_A | PAD_START))) {
+                return (sel == 0) ? 1 : 0;   /* 1 = start, 0 = quit */
+            }
+        }
+        prev = pad;
+
+        menu_clear();
+
+        /* Title */
+        menu_draw_str(140, "Welcome to SMB for Dreamcast", 0);
+
+        /* Hint */
+        menu_draw_str(180, "A / Start = Select", 0);
+
+        /* Menu items */
+        menu_draw_str(260, menu_labels[0], sel == 0);
+        menu_draw_str(300, menu_labels[1], sel == 1);
+
+        vid_waitvbl();
+    }
+}
+
 int main(int argc, char **argv)
 {
     uint8_t *rom;
@@ -121,6 +202,11 @@ int main(int argc, char **argv)
 
     /* 60 Hz output on every cable (PAL consoles use NTSC-60 interlaced on composite/RGB). */
     vid_set_mode(vid_check_cable() == CT_VGA ? DM_640x480_VGA : DM_640x480_NTSC_IL, PM_RGB565);
+
+    /* ---- Main menu (before ROM / PVR / audio) ---- */
+    if (!run_main_menu()) {
+        return 0;   /* player chose Quit */
+    }
 
     rom = load_file("/rd/smb.nes", &rom_size);
     if (!rom)                                         { fatal("smb.nes missing from romdisk"); return 1; }
