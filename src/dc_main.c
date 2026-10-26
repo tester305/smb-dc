@@ -15,6 +15,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <fcntl.h>
 
 #include <kos/init.h>
 #include <kos/thread.h>
@@ -29,6 +30,7 @@
 #include <dc/syscalls.h>
 #include <dc/wdt.h>
 #include <dc/vmu_pkg.h>
+#include <dc/fs_vmu.h>
 
 #include "nes.h"
 
@@ -680,7 +682,8 @@ done:
 #define MAX_CHEATS       32
 #define MAX_CHEAT_LENGTH 8
 #define MENU_ITEMS       4
-#define CHEAT_VMU_PATH   "/vmu/a1/SMBCHEAT.VMS"
+static char cheat_vmu_path[32] = "/vmu/a1/SMBCHEAT.VMS";
+static int cheat_load_status = -1;
 
 static char saved_cheats[MAX_CHEATS][MAX_CHEAT_LENGTH + 1];
 static int saved_cheat_count;
@@ -696,12 +699,11 @@ static const char *menu_labels[MENU_ITEMS] = {
 static int save_cheats_to_vmu(void)
 {
     char payload[512];
-    size_t used = 0;
-    int i, rc;
+    size_t used = 0, write_size;
+    int i, ok = 1;
     FILE *f;
+    file_t fd;
     vmu_pkg_t pkg;
-    uint8_t *packed = NULL;
-    int packed_size = 0;
     static const char magic[] = "SMBCHEATS1\n";
 
     memcpy(payload, magic, sizeof(magic) - 1);
@@ -716,7 +718,8 @@ static int save_cheats_to_vmu(void)
 
     memset(&pkg, 0, sizeof(pkg));
     strncpy(pkg.desc_short, "SMB Cheats", sizeof(pkg.desc_short) - 1);
-    strncpy(pkg.desc_long, "Super Mario Bros Game Genie Codes", sizeof(pkg.desc_long) - 1);
+    strncpy(pkg.desc_long, "Super Mario Bros Game Genie Codes",
+            sizeof(pkg.desc_long) - 1);
     strncpy(pkg.app_id, "SMB-DREAMCAST", sizeof(pkg.app_id) - 1);
     pkg.icon_cnt = 0;
     pkg.icon_anim_speed = 0;
@@ -724,23 +727,26 @@ static int save_cheats_to_vmu(void)
     pkg.data = (const uint8_t *)payload;
     pkg.data_len = (int)used;
 
-    rc = vmu_pkg_build(&pkg, &packed, &packed_size);
-    if (rc != 0 || !packed || packed_size <= 0) {
-        free(packed);
-        return 0;
-    }
-    f = fopen(CHEAT_VMU_PATH, "wb");
-    if (!f) {
-        free(packed);
-        return 0;
-    }
-    rc = (fwrite(packed, 1, (size_t)packed_size, f) == (size_t)packed_size);
-    if (fclose(f) != 0) rc = 0;
-    free(packed);
-    return rc;
+    /* VMU files occupy 512-byte blocks; the header records the true length. */
+    write_size = (used + 511U) & ~(size_t)511U;
+    memset(payload + used, 0, write_size - used);
+
+    /* The /vmu filesystem stores the payload, not a second packed package. */
+    f = fopen(cheat_vmu_path, "wb");
+    if (!f) return 0;
+    if (fwrite(payload, 1, write_size, f) != write_size) ok = 0;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) return 0;
+
+    /* Store the package metadata separately so the BIOS recognizes the file. */
+    fd = fs_open(cheat_vmu_path, O_WRONLY);
+    if (fd < 0) return 0;
+    if (fs_vmu_set_header(fd, &pkg) < 0) ok = 0;
+    fs_close(fd);
+    return ok;
 }
 
-static void load_cheats_from_vmu(void)
+static int load_cheats_from_path(const char *path)
 {
     FILE *f;
     long end;
@@ -749,25 +755,24 @@ static void load_cheats_from_vmu(void)
     const char *data;
     size_t pos, data_len;
     static const char magic[] = "SMBCHEATS1\n";
+    int count_before = saved_cheat_count;
 
-    /* Only parse the VMU data here. The NES core is not loaded yet, so
-       applying codes now can be lost when nes_load()/nes_reset() run. */
-    saved_cheat_count = 0;
-    f = fopen(CHEAT_VMU_PATH, "rb");
-    if (!f) return;
+    f = fopen(path, "rb");
+    if (!f) return 0;
     if (fseek(f, 0, SEEK_END) != 0 || (end = ftell(f)) <= 0 ||
         fseek(f, 0, SEEK_SET) != 0) {
         fclose(f);
-        return;
+        return 0;
     }
     raw = (uint8_t *)malloc((size_t)end);
-    if (!raw) { fclose(f); return; }
+    if (!raw) { fclose(f); return 0; }
     if (fread(raw, 1, (size_t)end, f) != (size_t)end) {
-        free(raw); fclose(f); return;
+        free(raw); fclose(f); return 0;
     }
     fclose(f);
 
-    /* New saves are raw text payloads. Accept old packed-package saves too. */
+    /* The VMU filesystem exposes file payload bytes, not the BIOS header.
+       Also accept package-wrapped files made by earlier builds. */
     data = (const char *)raw;
     data_len = (size_t)end;
     if (data_len < sizeof(magic) - 1 ||
@@ -777,7 +782,7 @@ static void load_cheats_from_vmu(void)
             pkg.data_len < (int)(sizeof(magic) - 1) ||
             memcmp(pkg.data, magic, sizeof(magic) - 1) != 0) {
             free(raw);
-            return;
+            return 0;
         }
         data = (const char *)pkg.data;
         data_len = (size_t)pkg.data_len;
@@ -786,7 +791,8 @@ static void load_cheats_from_vmu(void)
     pos = sizeof(magic) - 1;
     while (pos < data_len && saved_cheat_count < MAX_CHEATS) {
         char code[MAX_CHEAT_LENGTH + 1];
-        size_t n = 0;
+        size_t n = 0, j;
+        int valid = 1;
         while (pos < data_len && data[pos] != '\n' && data[pos] != '\0' &&
                n < MAX_CHEAT_LENGTH)
             code[n++] = data[pos++];
@@ -794,22 +800,58 @@ static void load_cheats_from_vmu(void)
         if (pos < data_len && data[pos] == '\n') pos++;
         if (pos < data_len && data[pos] == '\0') break;
         code[n] = '\0';
-        if (n == 6 || n == 8) {
-            size_t j;
-            int valid = 1;
-            for (j = 0; j < n; ++j) {
-                if (!strchr("APZLGITYEOXUKSVN", code[j])) {
-                    valid = 0;
-                    break;
-                }
-            }
-            if (valid) {
-                memcpy(saved_cheats[saved_cheat_count], code, n + 1);
-                saved_cheat_count++;
-            }
+        if (n != 6 && n != 8) continue;
+        for (j = 0; j < n; ++j) {
+            if (!strchr("APZLGITYEOXUKSVN", code[j])) { valid = 0; break; }
+        }
+        if (valid) {
+            memcpy(saved_cheats[saved_cheat_count], code, n + 1);
+            saved_cheat_count++;
         }
     }
     free(raw);
+    return saved_cheat_count > count_before ? 1 : 2;
+}
+
+static void load_cheats_from_vmu(void)
+{
+    static const char *const slots[] = {
+        "/vmu/a1/SMBCHEAT.VMS", "/vmu/a2/SMBCHEAT.VMS",
+        "/vmu/b1/SMBCHEAT.VMS", "/vmu/b2/SMBCHEAT.VMS",
+        "/vmu/c1/SMBCHEAT.VMS", "/vmu/c2/SMBCHEAT.VMS",
+        "/vmu/d1/SMBCHEAT.VMS", "/vmu/d2/SMBCHEAT.VMS"
+    };
+    size_t i;
+
+    saved_cheat_count = 0;
+    cheat_load_status = 0;
+    /* Search all eight controller VMU slots, not only controller A/slot 1. */
+    {
+        int empty_file_found = 0;
+        const char *empty_file_path = NULL;
+        for (i = 0; i < sizeof(slots) / sizeof(slots[0]); ++i) {
+            int result = load_cheats_from_path(slots[i]);
+            if (result == 1) {
+                strncpy(cheat_vmu_path, slots[i], sizeof(cheat_vmu_path) - 1);
+                cheat_vmu_path[sizeof(cheat_vmu_path) - 1] = '\0';
+                cheat_load_status = 1;
+                return;
+            }
+            if (result == 2 && !empty_file_found) {
+                empty_file_found = 1;
+                empty_file_path = slots[i];
+            }
+        }
+        if (empty_file_found) {
+            strncpy(cheat_vmu_path, empty_file_path, sizeof(cheat_vmu_path) - 1);
+            cheat_vmu_path[sizeof(cheat_vmu_path) - 1] = '\0';
+            cheat_load_status = 2;
+            return;
+        }
+    }
+    /* No existing file found; future saves go to the conventional A1 slot. */
+    strncpy(cheat_vmu_path, slots[0], sizeof(cheat_vmu_path) - 1);
+    cheat_vmu_path[sizeof(cheat_vmu_path) - 1] = '\0';
 }
 
 /* Activate only after nes_load() and nes_reset(), which initialize the core. */
@@ -942,9 +984,12 @@ static void list_cheat_codes(void)
                 menu_draw_str(120 + i * 35, line, 0);
             }
         }
-        menu_draw_str(350, cheat_save_status == 1 ? "Codes saved on VMU A1" :
-                           (cheat_save_status == 0 ? "VMU save failed (codes RAM-only)" :
-                            "Codes load from VMU A1 when available"), 0);
+        menu_draw_str(330, cheat_load_status == 1 ? "Loaded codes from VMU" :
+                           (cheat_load_status == 2 ? "VMU file found; no valid codes" :
+                            "No readable cheat file found"), 0);
+        menu_draw_str(355, cheat_save_status == 1 ? "Last save succeeded" :
+                           (cheat_save_status == 0 ? "Last VMU save failed" :
+                            "Save target: detected slot / A1"), 0);
         menu_draw_str(385, "B = return", 0);
         menu_present();
     }
