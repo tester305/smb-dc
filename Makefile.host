@@ -1,13 +1,22 @@
-# Host-side (PC) test build of the emulation core.  `make -f Makefile.host test ROM=path/to/main.nes`
+# Host-side (PC) builds of the emulation core.
+#   make -f Makefile.host test     ROM=path/to/main.nes     headless play-through, writes /tmp/frame_*.ppm and /tmp/out.wav
+#   make -f Makefile.host apu-test ROM=path/to/main.nes     APU accuracy test   (APU=path/to/other_apu.c to test another APU source)
 CFLAGS ?= -O2 -Wall
 SRCS = src/cpu.c src/ppu.c src/apu.c src/nes.c src/host_main.c
 ROM ?= main.nes
+APU ?= ../src/apu.c
 
 smb_host: $(SRCS) src/nes.h
-	$(CC) $(CFLAGS) -o $@ $(SRCS)
+	$(CC) $(CFLAGS) -o $@ $(SRCS) -lm
 
 test: smb_host
 	./smb_host $(ROM) 1800
 
+apu_test: tests/apu_test.c src/apu.c src/nes.h
+	$(CC) $(CFLAGS) -Isrc -DAPU_SRC='"$(APU)"' -o $@ tests/apu_test.c src/cpu.c src/ppu.c src/nes.c -lm
+
+apu-test: apu_test
+	./apu_test $(ROM) 1800
+
 clean:
-	rm -f smb_host
+	rm -f smb_host apu_test
