@@ -684,12 +684,14 @@ done:
 #define MENU_ITEMS       4
 #define CHEAT_FILE       "SMBCHEAT.VMS"
 #define CHEAT_BLOCK      512            /* one VMU block: enough for all 32 codes */
-#define CHEAT_MAGIC      "SMBCHEATS1\n"
+#define CHEAT_MAGIC_V1   "SMBCHEATS1\n"     /* older files: every code is enabled */
+#define CHEAT_MAGIC      "SMBCHEATS2\n"     /* current: a leading '-' marks a disabled code */
 
 static char cheat_vmu_path[40];         /* "/vmu/a1/SMBCHEAT.VMS" once a VMU is known */
 static int  cheat_load_status = -1;     /* -1 not tried, 0 VMU but no file, 1 loaded, 2 file empty, 3 no VMU */
 static int  cheat_save_status = -1;     /* -1 never saved, 0 failed, 1 ok */
 static char saved_cheats[MAX_CHEATS][MAX_CHEAT_LENGTH + 1];
+static uint8_t saved_enabled[MAX_CHEATS];   /* 1 = applied when the game starts, 0 = kept but switched off */
 static int  saved_cheat_count;
 /* Alphabetical order of the 16 valid Game Genie characters. */
 static const char cheat_alphabet[] = "AEGIKLNOPSTUVXYZ";
@@ -725,7 +727,8 @@ static void vmu_label(char *out, size_t sz)
 }
 
 /* Read the cheat file.  Returns the number of codes added, or -1 if the file is missing/unreadable.
-   The KOS VMU filesystem strips the BIOS header for us, so we simply read the first block. */
+   The KOS VMU filesystem strips the BIOS header for us, so we simply read the first block.
+   Files from the first version have no on/off marks: all their codes load as enabled. */
 static int load_cheats_from_path(const char *path)
 {
     char buf[CHEAT_BLOCK + 1];
@@ -733,28 +736,35 @@ static int load_cheats_from_path(const char *path)
     size_t pos;
     ssize_t got;
     file_t fd;
-    int added = 0;
+    int added = 0, v2;
 
     fd = fs_open(path, O_RDONLY);
     if (fd == FILEHND_INVALID) return -1;
     memset(buf, 0, sizeof(buf));
     got = fs_read(fd, buf, CHEAT_BLOCK);
     fs_close(fd);
-    if (got < (ssize_t)mlen || memcmp(buf, CHEAT_MAGIC, mlen) != 0) return -1;
+    if (got < (ssize_t)mlen) return -1;
+    v2 = (memcmp(buf, CHEAT_MAGIC, mlen) == 0);
+    if (!v2 && memcmp(buf, CHEAT_MAGIC_V1, mlen) != 0) return -1;
 
     pos = mlen;
     while (pos < CHEAT_BLOCK && buf[pos] && saved_cheat_count < MAX_CHEATS) {
-        char code[MAX_CHEAT_LENGTH + 1];
+        char line[MAX_CHEAT_LENGTH + 2];                /* optional '-' + up to 8 letters */
         size_t n = 0;
         while (pos < CHEAT_BLOCK && buf[pos] && buf[pos] != '\n') {
-            if (n < MAX_CHEAT_LENGTH) code[n] = buf[pos];
+            if (n < sizeof(line) - 1) line[n] = buf[pos];
             n++; pos++;
         }
         if (pos < CHEAT_BLOCK && buf[pos] == '\n') pos++;
-        if (n <= MAX_CHEAT_LENGTH) {            /* the last code is added too: it is followed by zero padding */
-            code[n] = '\0';
-            if (cheat_code_ok(code, n)) {
-                memcpy(saved_cheats[saved_cheat_count], code, n + 1);
+        if (n <= sizeof(line) - 1) {                    /* the last code is added too: it is followed by zero padding */
+            const char *code = line;
+            size_t cn = n;
+            int enabled = 1;
+            line[n] = '\0';
+            if (v2 && n > 0 && line[0] == '-') { enabled = 0; code = line + 1; cn = n - 1; }
+            if (cheat_code_ok(code, cn)) {
+                memcpy(saved_cheats[saved_cheat_count], code, cn + 1);
+                saved_enabled[saved_cheat_count] = (uint8_t)enabled;
                 saved_cheat_count++;
                 added++;
             }
@@ -812,7 +822,8 @@ static int save_cheats_to_vmu(void)
     memcpy(payload, CHEAT_MAGIC, used);
     for (i = 0; i < saved_cheat_count; ++i) {
         size_t n = strlen(saved_cheats[i]);
-        if (used + n + 1 > sizeof(payload)) return 0;
+        if (used + n + 2 > sizeof(payload)) return 0;
+        if (!saved_enabled[i]) payload[used++] = '-';
         memcpy(payload + used, saved_cheats[i], n);
         used += n;
         payload[used++] = '\n';
@@ -840,7 +851,8 @@ static void apply_saved_cheats(void)
     int i;
     nes_game_genie_clear();
     for (i = 0; i < saved_cheat_count; ++i)
-        (void)nes_game_genie_add(saved_cheats[i]);   /* a rejected code stays in the saved list */
+        if (saved_enabled[i])                        /* switched-off codes stay saved but are not applied */
+            (void)nes_game_genie_add(saved_cheats[i]);   /* a rejected code stays in the saved list */
 }
 
 /* Swallow buttons still held from the previous screen, so the press that opened a menu
@@ -910,6 +922,7 @@ static void add_cheat_code(void)
                 } else {
                     char where[16], line[64];
                     memcpy(saved_cheats[saved_cheat_count], code, (size_t)len + 1);
+                    saved_enabled[saved_cheat_count] = 1;
                     saved_cheat_count++;
                     cheat_save_status = save_cheats_to_vmu();
                     vmu_label(where, sizeof(where));
@@ -947,51 +960,102 @@ static void add_cheat_code(void)
     }
 }
 
-static void list_cheat_codes(void)
+/* Browse the saved codes: A switches the highlighted one on/off, Start deletes it, Y deletes all, B goes back.
+   Every change is written to the VMU straight away and takes effect the next time you Start Game. */
+static void manage_cheat_codes(void)
 {
-    int top = 0, i, quit_flag = 0, debounce = 0;
+    int sel = 0, top = 0, i, quit_flag = 0, debounce = 0, dirty = 1;
     uint8_t prev = 0;
     char where[16], line[64];
 
     wait_all_released();
-    vmu_label(where, sizeof(where));
     for (;;) {
         uint8_t pad = read_pad(&quit_flag);
         if (quit_flag) return;
-        if (((pad & PAD_B) && !(prev & PAD_B)) ||
-            ((pad & (PAD_A | PAD_START)) && !(prev & (PAD_A | PAD_START))))
+        if (debounce > 0) {
+            debounce--;
+        } else if ((pad & PAD_B) && !(prev & PAD_B)) {
             return;
-        if (debounce > 0) debounce--;
-        else if ((pad & PAD_UP) && !(prev & PAD_UP)) {
-            if (top > 0) top--;
-            debounce = 8;
+        } else if ((pad & PAD_UP) && !(prev & PAD_UP)) {
+            if (sel > 0) sel--;
+            debounce = 8; dirty = 1;
         } else if ((pad & PAD_DOWN) && !(prev & PAD_DOWN)) {
-            if (top + 6 < saved_cheat_count) top++;
-            debounce = 8;
+            if (sel + 1 < saved_cheat_count) sel++;
+            debounce = 8; dirty = 1;
+        } else if (saved_cheat_count > 0 && (pad & PAD_A) && !(prev & PAD_A)) {
+            saved_enabled[sel] ^= 1;
+            cheat_save_status = save_cheats_to_vmu();
+            if (!cheat_save_status)
+                show_message("VMU save FAILED - switch kept for now",
+                             "It may revert after a reboot");
+            prev = pad; debounce = 8; dirty = 1;
+            continue;
+        } else if (saved_cheat_count > 0 && (pad & PAD_START) && !(prev & PAD_START)) {
+            snprintf(line, sizeof(line), "Delete code %s ?", saved_cheats[sel]);
+            if (confirm_yes_no(line, "It is also removed from the VMU.")) {
+                memmove(saved_cheats[sel], saved_cheats[sel + 1],
+                        (size_t)(saved_cheat_count - sel - 1) * sizeof(saved_cheats[0]));
+                memmove(&saved_enabled[sel], &saved_enabled[sel + 1], (size_t)(saved_cheat_count - sel - 1));
+                saved_cheat_count--;
+                if (sel >= saved_cheat_count && sel > 0) sel--;
+                cheat_save_status = save_cheats_to_vmu();
+                if (!cheat_save_status)
+                    show_message("VMU save FAILED - code removed for now",
+                                 "It may come back after a reboot");
+            }
+            wait_all_released();
+            prev = 0; debounce = 10; dirty = 1;
+            continue;
+        } else if (saved_cheat_count > 0 && (pad & PAD_SELECT) && !(prev & PAD_SELECT)) {
+            if (confirm_yes_no("Delete ALL saved codes?", "They are also removed from the VMU.")) {
+                saved_cheat_count = 0;
+                sel = top = 0;
+                cheat_save_status = save_cheats_to_vmu();
+                if (!cheat_save_status)
+                    show_message("VMU save FAILED - codes removed for now",
+                                 "They may come back after a reboot");
+            }
+            wait_all_released();
+            prev = 0; debounce = 10; dirty = 1;
+            continue;
         }
         prev = pad;
-        menu_clear();
-        menu_draw_str(60, "Saved Game Genie Codes", 0);
-        if (saved_cheat_count == 0) {
-            menu_draw_str(150, "No codes saved yet", 0);
-        } else {
-            for (i = 0; i < 6 && top + i < saved_cheat_count; i++) {
-                snprintf(line, sizeof(line), "%02d: %s", top + i + 1, saved_cheats[top + i]);
-                menu_draw_str(120 + i * 35, line, 0);
+
+        if (sel < top) top = sel;
+        if (sel >= top + 6) top = sel - 5;
+        if (dirty) {
+            vmu_label(where, sizeof(where));
+            menu_clear();
+            menu_draw_str(50, "Manage Game Genie Codes", 0);
+            if (saved_cheat_count == 0) {
+                menu_draw_str(150, "No codes saved", 0);
+            } else {
+                for (i = 0; i < 6 && top + i < saved_cheat_count; i++) {
+                    snprintf(line, sizeof(line), "[%c] %02d: %s", saved_enabled[top + i] ? 'X' : ' ',
+                             top + i + 1, saved_cheats[top + i]);
+                    menu_draw_str(105 + i * 35, line, top + i == sel);
+                }
+                if (top > 0)                    menu_draw_str(85, "^", 0);
+                if (top + 6 < saved_cheat_count) menu_draw_str(315, "v", 0);
             }
+            switch (cheat_load_status) {
+            case 1:  { int on = 0, k; for (k = 0; k < saved_cheat_count; k++) on += saved_enabled[k];
+                       snprintf(line, sizeof(line), "%d of %d on, saved on %s", on, saved_cheat_count, where); } break;
+            case 2:  snprintf(line, sizeof(line), "Cheat file on %s", where); break;
+            case 0:  snprintf(line, sizeof(line), "No cheat file on %s yet", where); break;
+            case 3:  snprintf(line, sizeof(line), "No VMU found"); break;
+            default: snprintf(line, sizeof(line), "VMU not checked"); break;
+            }
+            menu_draw_str(335, line, 0);
+            menu_draw_str(365, "A = on/off   Start = delete   Y = delete all", 0);
+            menu_draw_str(395, "Up/Down = choose   B = back   (applies on Start Game)", 0);
+            if (cheat_save_status == 0)
+                menu_draw_str(425, "Last VMU save FAILED", 0);
+            menu_present();
+            dirty = 0;
+        } else {
+            vid_waitvbl();
         }
-        switch (cheat_load_status) {
-        case 1:  snprintf(line, sizeof(line), "Loaded %d code(s) from %s", saved_cheat_count, where); break;
-        case 2:  snprintf(line, sizeof(line), "Cheat file on %s is empty", where); break;
-        case 0:  snprintf(line, sizeof(line), "No cheat file on %s yet", where); break;
-        case 3:  snprintf(line, sizeof(line), "No VMU found"); break;
-        default: snprintf(line, sizeof(line), "VMU not checked"); break;
-        }
-        menu_draw_str(330, line, 0);
-        menu_draw_str(355, cheat_save_status == 1 ? "Last save succeeded" :
-                           (cheat_save_status == 0 ? "Last VMU save FAILED" : "Nothing saved this session"), 0);
-        menu_draw_str(385, "A / B = return", 0);
-        menu_present();
     }
 }
 
@@ -999,7 +1063,7 @@ static void run_cheats_menu(void)
 {
     int sel = 0, quit_flag = 0, debounce = 0, dirty = 1;
     uint8_t prev = 0;
-    const char *labels[] = { "Add Cheat Code", "List Cheat Codes", "Back" };
+    const char *labels[] = { "Add Cheat Code", "Manage Codes (on/off, delete)", "Back" };
 
     menu_init_font();
     wait_all_released();
@@ -1017,7 +1081,7 @@ static void run_cheats_menu(void)
                 sel = (sel + 1) % 3; debounce = 10; dirty = 1;
             } else if ((pad & (PAD_A | PAD_START)) && !(prev & (PAD_A | PAD_START))) {
                 if (sel == 0) add_cheat_code();
-                else if (sel == 1) list_cheat_codes();
+                else if (sel == 1) manage_cheat_codes();
                 else return;
                 wait_all_released();
                 prev = 0; debounce = 10; dirty = 1;
