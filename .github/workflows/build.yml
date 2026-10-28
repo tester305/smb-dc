@@ -1,3 +1,4 @@
+
 name: Build Dreamcast ELF
 
 on:
@@ -9,6 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -34,7 +36,7 @@ jobs:
           path: /opt/toolchains/dc/sh-elf
           key: kos-sh-elf-stable-ubuntu24-v1
 
-      - name: Build SH-4 toolchain (first run only, about an hour)
+      - name: Build SH-4 toolchain (first run only)
         if: steps.tc.outputs.cache-hit != 'true'
         run: |
           cd /opt/toolchains/dc/kos/utils/kos-chain
@@ -60,15 +62,18 @@ jobs:
           SMB_ROM_GZ_B64: ${{ secrets.SMB_ROM_GZ_B64 }}
         run: |
           . /opt/toolchains/dc/kos/environ.sh
+
           if [ -n "$SMB_ROM_GZ_B64" ]; then
             echo "$SMB_ROM_GZ_B64" | base64 -d | gunzip > "Super Mario Bros. (World).nes"
             ./build.sh "Super Mario Bros. (World).nes"
             rm -f "Super Mario Bros. (World).nes"
           else
-            echo "::warning::Secret SMB_ROM_GZ_B64 is not set - building without the game, the ELF will say smb.nes is missing"
+            echo "::warning::Secret SMB_ROM_GZ_B64 is not set - building without the game"
             mkdir -p romdisk
             make
           fi
+
+          test -s smb_dc.elf
 
       - name: Upload ELF
         uses: actions/upload-artifact@v4
@@ -78,23 +83,54 @@ jobs:
           if-no-files-found: error
 
       - name: Build mkdcdisc
-        continue-on-error: true
         run: |
           git clone --depth 1 https://gitlab.com/simulant/mkdcdisc.git "$HOME/mkdcdisc"
           cd "$HOME/mkdcdisc"
           meson setup builddir
           meson compile -C builddir
-          ./builddir/mkdcdisc -h || true
+          test -x builddir/mkdcdisc
+          ./builddir/mkdcdisc -h
 
-      - name: Make CDI disc image
-        continue-on-error: true
+      - name: Create padded, CD-R-ready CDI
         run: |
-          "$HOME/mkdcdisc/builddir/mkdcdisc" -e smb_dc.elf -o smb.cdi -n "SMB"
-          ls -l smb.cdi
+          "$HOME/mkdcdisc/builddir/mkdcdisc" \
+            -e smb_dc.elf \
+            -o smb_dc_burn_ready.cdi \
+            -n "SMB"
 
-      - name: Upload CDI
+          test -s smb_dc_burn_ready.cdi
+
+          echo "CD-R burn-ready image:"
+          ls -lh smb_dc_burn_ready.cdi
+          sha256sum smb_dc_burn_ready.cdi
+
+      - name: Upload padded CDI
         uses: actions/upload-artifact@v4
         with:
-          name: smb_dc_cdi
-          path: smb.cdi
-          if-no-files-found: warn
+          name: smb_dc_cdi_burn_ready
+          path: smb_dc_burn_ready.cdi
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Create compact, unpadded CDI
+        run: |
+          "$HOME/mkdcdisc/builddir/mkdcdisc" \
+            -N \
+            -e smb_dc.elf \
+            -o smb_dc.cdi \
+            -n "SMB"
+
+          test -s smb_dc.cdi
+
+          echo "Compact image:"
+          ls -lh smb_dc.cdi
+          du -h smb_dc.cdi
+          sha256sum smb_dc.cdi
+
+      - name: Upload compact CDI
+        uses: actions/upload-artifact@v4
+        with:
+          name: smb_dc_cdi_compact
+          path: smb_dc.cdi
+          if-no-files-found: error
+          compression-level: 0
